@@ -379,7 +379,11 @@ class PuffeRL:
                 'train_misc': perf[P.TRAIN_MISC],
                 'train_forward': perf[P.TRAIN_FORWARD],
             },
-            'util': dict(_C.get_utilization(self.args.get('gpu_id', 0))) if self.gpu else {},
+            'util': (
+                dict(_C.get_utilization(self.args.get('gpu_id', 0)))
+                if self.gpu else
+                {'backend': str(self.device).upper(), 'cpu_mem_gb': pufferlib.pufferl.current_rss_gb()}
+            ),
         }
         self.last_log_time = time.time()
         self.last_log_step = self.global_step
@@ -513,4 +517,3 @@ def load_policy(args, vec):
         policy.load_state_dict(state_dict)
 
     return policy
-

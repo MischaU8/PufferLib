@@ -12,6 +12,7 @@ import ast
 import time
 import argparse
 import configparser
+import resource
 from collections import defaultdict
 import multiprocessing as mp
 from copy import deepcopy
@@ -69,9 +70,28 @@ def fmt_perf(name, color, delta_ref, elapsed, b2, c2):
     percent = 0 if delta_ref == 0 else int(100*elapsed/delta_ref - 1e-5)
     return f'{color}{name}', duration(elapsed, b2, c2), f'{b2}{percent:2d}{c2}%'
 
+def current_rss_gb():
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform != 'darwin':
+        rss *= 1024
+    return rss / (1024.0 * 1024.0 * 1024.0)
+
 def print_dashboard(args, model_size, flat_logs, clear=False, idx=[0],
         c1='[cyan]', c2='[white]', b1='[bright_cyan]', b2='[bright_white]'):
     g = lambda k, d=0: flat_logs.get(k, d)
+    gpu_backend = bool(getattr(_C, 'gpu', 0))
+    backend = g('util/backend', 'CUDA' if gpu_backend else 'CPU')
+    device_label = (
+        f'{c1}GPU: {b2}{g("util/gpu_percent"):.0f}{c2}%'
+        if gpu_backend else
+        f'{c1}Device: {b2}{backend}{c2}'
+    )
+    memory_label = (
+        f'{c1}VRAM: {b2}{g("util/vram_used_gb"):.1f}{c2}/{b2}{g("util/vram_total_gb"):.0f}{c2}G'
+        if gpu_backend else
+        ''
+    )
+    eval_accel_label = '  GPU' if gpu_backend else '  Policy'
     console = rich.console.Console()
     dashboard = Table(box=rich.box.ROUNDED, expand=True,
         show_header=False, border_style='bright_cyan')
@@ -85,9 +105,9 @@ def print_dashboard(args, model_size, flat_logs, clear=False, idx=[0],
 
     table.add_row(
         f'{b1}PufferLib {b2}4.0 {idx[0]*" "}:blowfish:',
-        f'{c1}GPU: {b2}{g("util/gpu_percent"):.0f}{c2}%',
-        f'{c1}VRAM: {b2}{g("util/vram_used_gb"):.1f}{c2}/{b2}{g("util/vram_total_gb"):.0f}{c2}G',
-        f'{c1}RAM: {b2}{g("util/cpu_mem_gb"):.1f}{c2}G',
+        device_label,
+        memory_label,
+        f'{c1}RAM: {b2}{g("util/cpu_mem_gb", current_rss_gb()):.1f}{c2}G',
     )
     idx[0] = (idx[0] - 1) % 10
 
@@ -115,7 +135,7 @@ def print_dashboard(args, model_size, flat_logs, clear=False, idx=[0],
     p.add_column(f"{c1}Time", justify="right", width=8)
     p.add_column(f"{c1}%", justify="right", width=4)
     p.add_row(*fmt_perf('Evaluate', b1, delta, rollout, b2, c2))
-    p.add_row(*fmt_perf('  GPU', b2, delta, g('perf/eval_gpu'), b2, c2))
+    p.add_row(*fmt_perf(eval_accel_label, b2, delta, g('perf/eval_gpu'), b2, c2))
     p.add_row(*fmt_perf('  Env', b2, delta, g('perf/eval_env'), b2, c2))
     p.add_row(*fmt_perf('Train', b1, delta, train, b2, c2))
     p.add_row(*fmt_perf('  Misc', b2, delta, g('perf/train_misc'), b2, c2))
@@ -172,7 +192,7 @@ def _resolve_backend(args):
     compiled_env = getattr(_C, 'env_name', None)
     assert compiled_env is None or compiled_env == args['env_name'], \
         f'build.sh was run for {compiled_env}, not {args["env_name"]}'
-    if args.get('slowly'):
+    if args.get('slowly') or not getattr(_C, 'gpu', 0):
         from pufferlib.torch_pufferl import PuffeRL
         return PuffeRL
     return _C
@@ -384,7 +404,7 @@ def train(env_name, args=None, gpus=None, **kwargs):
     gpus = list(gpus or range(args['train']['gpus']))
     args['train']['total_timesteps'] //= len(gpus)
     args['world_size'] = len(gpus)
-    args['nccl_id'] = _C.get_nccl_id() if len(gpus) > 1 else b''
+    args['nccl_id'] = _C.get_nccl_id() if len(gpus) > 1 and getattr(_C, 'gpu', 0) else b''
 
     if not subprocess:
         gpus = gpus[-1:] + gpus[:-1]  # Main process gets rank 0

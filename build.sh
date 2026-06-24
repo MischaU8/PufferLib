@@ -52,18 +52,35 @@ fi
 
 # Linux/mac
 PLATFORM="$(uname -s)"
+MACHINE="$(uname -m)"
 if [ "$PLATFORM" = "Linux" ]; then
     RAYLIB_NAME='raylib-5.5_linux_amd64'
     OMP_LIB=-lomp5
+    OPENMP_CFLAGS=(-fopenmp)
+    OPENMP_LDFLAGS=($OMP_LIB)
     SANITIZE_FLAGS=(-fsanitize=address,undefined,bounds,pointer-overflow,leak -fno-omit-frame-pointer)
     STANDALONE_LDFLAGS=(-lGL)
+    STATIC_CFLAGS=(-fno-semantic-interposition)
     SHARED_LDFLAGS=(-Bsymbolic-functions)
 else
     RAYLIB_NAME='raylib-5.5_macos'
     OMP_LIB=-lomp
+    OPENMP_CFLAGS=(-Xpreprocessor -fopenmp)
+    OPENMP_LDFLAGS=($OMP_LIB)
     SANITIZE_FLAGS=()
     STANDALONE_LDFLAGS=(-framework Cocoa -framework IOKit -framework CoreVideo -framework OpenGL)
+    STATIC_CFLAGS=()
     SHARED_LDFLAGS=(-framework Cocoa -framework OpenGL -framework IOKit -undefined dynamic_lookup)
+fi
+
+if [ "$PLATFORM" = "Darwin" ] && [ -z "$MODE" ]; then
+    echo "Defaulting to CPU backend on macOS. Use CUDA/HIP builds on Linux."
+    MODE=cpu
+    PRECISION="-DPRECISION_FLOAT"
+elif [ -z "$MODE" ] && ! command -v nvcc >/dev/null 2>&1; then
+    echo "nvcc not found; defaulting to CPU backend."
+    MODE=cpu
+    PRECISION="-DPRECISION_FLOAT"
 fi
 
 CLANG_WARN=(
@@ -99,6 +116,16 @@ INCLUDES=(-I./$RAYLIB_NAME/include -I./src -I./vendor)
 LINK_ARCHIVES=("$RAYLIB_A")
 EXTRA_SRC=""
 EXTRA_LDFLAGS=()
+
+if [ "$PLATFORM" = "Darwin" ]; then
+    for omp_prefix in /opt/homebrew/opt/libomp /usr/local/opt/libomp; do
+        if [ -d "$omp_prefix" ]; then
+            EXTRA_CFLAGS+=" -I$omp_prefix/include"
+            EXTRA_LDFLAGS+=("-L$omp_prefix/lib")
+            break
+        fi
+    done
+fi
 
 if [ "$ENV" = "constellation" ]; then
     SRC_DIR="constellation"
@@ -142,8 +169,11 @@ OUTPUT_NAME=${OUTPUT_NAME:-$ENV}
 
 # Standalone environment build
 # -mavx2 enables AVX2 intrinsics (__m256, _mm256_*) which drive.h and
-# src/bf16.h use directly. x86_64 only — strip if porting to ARM/Apple Silicon.
-SIMD_FLAGS=(-mavx2 -mfma)
+# src/bf16.h use directly. x86_64 only.
+SIMD_FLAGS=()
+if [ "$MACHINE" = "x86_64" ]; then
+    SIMD_FLAGS=(-mavx2 -mfma)
+fi
 if [ -n "$DEBUG" ] || [ "$MODE" = "local" ]; then
     CLANG_OPT=(-g -O0 "${CLANG_WARN[@]}" "${SANITIZE_FLAGS[@]}" "${SIMD_FLAGS[@]}")
     NVCC_OPT="-O0 -g"
@@ -160,11 +190,11 @@ if [ "$MODE" = "local" ] || [ "$MODE" = "fast" ]; then
         "${LINK_ARCHIVES[@]}"
         "${EXTRA_LDFLAGS[@]}"
         "${STANDALONE_LDFLAGS[@]}"
-        -lm -lpthread -fopenmp
+        -lm -lpthread "${OPENMP_LDFLAGS[@]}"
         -DPLATFORM_DESKTOP
     )
     echo "Compiling $ENV..."
-    ${CC:-clang} "${CLANG_OPT[@]}" "${FLAGS[@]}"
+    ${CC:-clang} "${CLANG_OPT[@]}" $EXTRA_CFLAGS "${OPENMP_CFLAGS[@]}" "${FLAGS[@]}"
     echo "Built: ./$OUTPUT_NAME"
     exit 0
 elif [ "$MODE" = "web" ]; then
@@ -264,8 +294,8 @@ ${CC:-clang} -c "${CLANG_OPT[@]}" $EXTRA_CFLAGS \
     "${INCLUDES[@]}" \
     -I./$RAYLIB_NAME/include -I$CUDA_HOME/include \
     -DPLATFORM_DESKTOP \
-    -fno-semantic-interposition -fvisibility=hidden \
-    -fPIC -fopenmp \
+    "${STATIC_CFLAGS[@]}" -fvisibility=hidden \
+    -fPIC "${OPENMP_CFLAGS[@]}" \
     "$BINDING_SRC" -o "$STATIC_OBJ"
 ar rcs "$STATIC_LIB" "$STATIC_OBJ"
 
@@ -293,13 +323,13 @@ if [ -z "$MODE" ]; then
         src/bindings.cu -o build/bindings.o
 
     LINK_CMD=(
-        ${CXX:-g++} -shared -fPIC -fopenmp
+        ${CXX:-g++} -shared -fPIC "${OPENMP_CFLAGS[@]}"
         build/bindings.o "$STATIC_LIB" "$RAYLIB_A"
         -L$CUDA_HOME/lib64 $CUDNN_LFLAG $NCCL_LFLAG
         "${WHEEL_RPATH_FLAGS[@]}"
         "${EXTRA_LDFLAGS[@]}"
         -lcudart -lnccl -lnvidia-ml -lcublas -lcusolver -lcurand -lcudnn
-        $OMP_LIB $LINK_OPT
+        "${OPENMP_LDFLAGS[@]}" $LINK_OPT
         "${SHARED_LDFLAGS[@]}"
         -o "$OUTPUT"
     )
@@ -308,7 +338,7 @@ if [ -z "$MODE" ]; then
 
 elif [ "$MODE" = "cpu" ]; then
     echo "Compiling CPU training backend..."
-    ${CXX:-g++} -c -fPIC -fopenmp \
+    ${CXX:-g++} -c -fPIC $EXTRA_CFLAGS "${OPENMP_CFLAGS[@]}" \
         -D_GLIBCXX_USE_CXX11_ABI=1 \
         -DPLATFORM_DESKTOP \
         -std=c++17 \
@@ -319,10 +349,10 @@ elif [ "$MODE" = "cpu" ]; then
         $PRECISION $LINK_OPT \
         src/bindings_cpu.cpp -o build/bindings_cpu.o
     LINK_CMD=(
-        ${CXX:-g++} -shared -fPIC -fopenmp
+        ${CXX:-g++} -shared -fPIC "${OPENMP_CFLAGS[@]}"
         build/bindings_cpu.o "$STATIC_LIB" "$RAYLIB_A"
         "${EXTRA_LDFLAGS[@]}"
-        -lm -lpthread $OMP_LIB $LINK_OPT
+        -lm -lpthread "${OPENMP_LDFLAGS[@]}" $LINK_OPT
         "${SHARED_LDFLAGS[@]}"
         -o "$OUTPUT"
     )
