@@ -80,7 +80,7 @@ def print_dashboard(args, model_size, flat_logs, clear=False, idx=[0],
         c1='[cyan]', c2='[white]', b1='[bright_cyan]', b2='[bright_white]'):
     g = lambda k, d=0: flat_logs.get(k, d)
     gpu_backend = bool(getattr(_C, 'gpu', 0))
-    backend = g('util/backend', 'CUDA' if gpu_backend else 'CPU')
+    backend = g('util/backend', args.get('torch_device', 'CUDA' if gpu_backend else 'CPU'))
     device_label = (
         f'{c1}GPU: {b2}{g("util/gpu_percent"):.0f}{c2}%'
         if gpu_backend else

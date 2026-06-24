@@ -69,7 +69,7 @@ def sample_logits(logits, action=None):
 
     if action is None:
         probs = torch.nan_to_num(probs, 1e-8, 1e-8, 1e-8)
-        action = torch.multinomial(probs.reshape(-1, probs.shape[-1]), 1, replacement=True).int()
+        action = _multinomial(probs.reshape(-1, probs.shape[-1]), 1, replacement=True).int()
         action = action.reshape(probs.shape[:-1])
     else:
         batch = logits[0].shape[0]
@@ -99,6 +99,29 @@ _TORCH_TO_CTYPE = {
     torch.float32: ctypes.c_float,
 }
 
+def _select_device():
+    override = os.environ.get('PUFFER_TORCH_DEVICE')
+    if override:
+        override = override.lower()
+        if override == 'auto':
+            if _C.gpu:
+                return 'cuda'
+            return 'mps' if torch.backends.mps.is_available() else 'cpu'
+        if override == 'mps' and not torch.backends.mps.is_available():
+            raise RuntimeError('PUFFER_TORCH_DEVICE=mps but PyTorch MPS is not available')
+        if override == 'cuda' and not torch.cuda.is_available():
+            raise RuntimeError('PUFFER_TORCH_DEVICE=cuda but PyTorch CUDA is not available')
+        return override
+    if _C.gpu:
+        return 'cuda'
+    return 'cpu'
+
+def _multinomial(probs, num_samples, replacement=True):
+    if probs.device.type == 'mps':
+        idx = torch.multinomial(probs.cpu(), num_samples, replacement=replacement)
+        return idx.to(probs.device)
+    return torch.multinomial(probs, num_samples, replacement=replacement)
+
 def _actions_for_vec_step(action):
     if action.dim() == 1:
         action = action.unsqueeze(-1)
@@ -116,12 +139,13 @@ def _cpu_tensor(ptr, shape, dtype):
 class PuffeRL:
     def __init__(self, args, vec, policy, verbose=True):
         config = args['train']
-        device = 'cuda' if _C.gpu else 'cpu'
+        device = _select_device()
         self.device = device
 
         torch.set_float32_matmul_precision('high')
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = True
+        if _C.gpu:
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = True
 
         self._vec = vec
         self.gpu = vec.gpu
@@ -171,6 +195,7 @@ class PuffeRL:
         )
 
         self.args = args
+        self.args['torch_device'] = str(device).upper()
         self.config = config
         self.world_size = args['world_size']
         self.epoch = 0
@@ -178,7 +203,7 @@ class PuffeRL:
         self.last_log_step = 0
         self.last_log_time = time.time()
         self.start_time = time.time()
-        self.profile = Profile(gpu=self.gpu)
+        self.profile = Profile(gpu=self.gpu, device=device)
         self.verbose = verbose
 
         self.model_size = sum(p.numel() for p in policy.parameters() if p.requires_grad)
@@ -234,10 +259,11 @@ class PuffeRL:
             prof.mark(2)
             actions_flat = _actions_for_vec_step(action)
             if self.gpu:
-                actions_flat = actions_flat.cuda()
+                actions_flat = actions_flat.to('cuda')
                 self._vec.gpu_step(actions_flat.data_ptr())
                 torch.cuda.synchronize()
             else:
+                actions_flat = actions_flat.cpu()
                 self._vec.cpu_step(actions_flat.data_ptr())
 
             o, r, d = self.vec_obs, self.vec_rewards, self.vec_terminals
@@ -291,8 +317,7 @@ class PuffeRL:
             adv = advantages.abs().sum(axis=1)
             prio_weights = torch.nan_to_num(adv**a, 0, 0, 0)
             prio_probs = (prio_weights + 1e-6)/(prio_weights.sum() + 1e-6)
-            idx = torch.multinomial(prio_probs,
-                self.minibatch_segments, replacement=True)
+            idx = _multinomial(prio_probs, self.minibatch_segments, replacement=True)
             mb_prio = (self.total_agents*prio_probs[idx, None])**-anneal_beta
 
             mb_obs = obs[idx]
@@ -382,7 +407,7 @@ class PuffeRL:
             'util': (
                 dict(_C.get_utilization(self.args.get('gpu_id', 0)))
                 if self.gpu else
-                {'backend': str(self.device).upper(), 'cpu_mem_gb': pufferlib.pufferl.current_rss_gb()}
+                {'cpu_mem_gb': pufferlib.pufferl.current_rss_gb()}
             ),
         }
         self.last_log_time = time.time()
@@ -412,7 +437,7 @@ class PuffeRL:
     def create_pufferl(cls, args):
         '''Matches _C.create_pufferl(args) interface.'''
         # DDP setup
-        if 'LOCAL_RANK' in os.environ:
+        if _C.gpu and 'LOCAL_RANK' in os.environ:
             world_size = int(os.environ.get('WORLD_SIZE', 1))
             local_rank = int(os.environ['LOCAL_RANK'])
             torch.cuda.set_device(local_rank)
@@ -422,7 +447,7 @@ class PuffeRL:
         vec = _C.create_vec(args, _C.gpu)
         policy = load_policy(args, vec)
 
-        if 'LOCAL_RANK' in os.environ:
+        if _C.gpu and 'LOCAL_RANK' in os.environ:
             torch.distributed.init_process_group(backend='nccl', world_size=world_size)
             policy = policy.to(local_rank)
             model = torch.nn.parallel.DistributedDataParallel(
@@ -435,8 +460,27 @@ class PuffeRL:
 
         return cls(args, vec, policy)
 
+def _compute_puff_advantage_torch(values, rewards, terminals,
+        ratio, advantages, gamma, gae_lambda, vtrace_rho_clip, vtrace_c_clip):
+    num_steps, horizon = values.shape
+    last = torch.zeros(num_steps, device=values.device, dtype=values.dtype)
+    for t in range(horizon - 2, -1, -1):
+        nextnonterminal = 1.0 - terminals[:, t + 1]
+        importance = ratio[:, t]
+        rho_t = torch.clamp(importance, max=vtrace_rho_clip)
+        c_t = torch.clamp(importance, max=vtrace_c_clip)
+        delta = rho_t * rewards[:, t + 1] + gamma * values[:, t + 1] * nextnonterminal - values[:, t]
+        last = delta + gamma * gae_lambda * c_t * last * nextnonterminal
+        advantages[:, t] = last
+    return advantages
+
 def compute_puff_advantage(values, rewards, terminals,
         ratio, advantages, gamma, gae_lambda, vtrace_rho_clip, vtrace_c_clip):
+    if values.device.type == 'mps':
+        return _compute_puff_advantage_torch(values, rewards,
+            terminals, ratio, advantages, gamma, gae_lambda,
+            vtrace_rho_clip, vtrace_c_clip)
+
     num_steps, horizon = values.shape
     fn = _C.puff_advantage if values.is_cuda else _C.puff_advantage_cpu
     fn(
@@ -450,18 +494,24 @@ class Profile:
     '''Matches pufferlib.cu profiling: accumulate ms, report seconds.'''
     ROLLOUT, EVAL_GPU, EVAL_ENV, TRAIN, TRAIN_MISC, TRAIN_FORWARD, NUM = range(7)
 
-    def __init__(self, gpu=True):
+    def __init__(self, gpu=True, device='cpu'):
         self.accum = [0.0] * Profile.NUM
         self.gpu = gpu
+        self.device_type = torch.device(device).type
         if gpu:
             self._events = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
         else:
             self._stamps = [0.0] * 4
 
+    def _sync(self):
+        if self.device_type == 'mps' and os.environ.get('PUFFER_PROFILE_SYNC_MPS'):
+            torch.mps.synchronize()
+
     def mark(self, idx):
         if self.gpu:
             self._events[idx].record()
         else:
+            self._sync()
             self._stamps[idx] = time.perf_counter()
 
     def elapsed(self, idx, start_ev, end_ev):
@@ -488,7 +538,7 @@ def load_policy(args, vec):
     decoder = decoder_cls(vec.act_sizes, policy_kwargs['hidden_size'])
     policy = pufferlib.models.Policy(encoder, decoder, network)
 
-    device = 'cuda' if _C.gpu else 'cpu'
+    device = _select_device()
     policy = policy.to(device)
 
     load_id = args['load_id']

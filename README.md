@@ -17,6 +17,14 @@ brew install libomp
 
 Homebrew installs `libomp` as keg-only. `build.sh` detects the standard Homebrew paths automatically; for a nonstandard install, set `CPPFLAGS` and `LDFLAGS` to your `libomp` include and lib directories.
 
+MPS is available as an opt-in torch device for policy and training tensors while keeping environment stepping on CPU:
+
+```bash
+PUFFER_TORCH_DEVICE=mps puffer train breakout
+```
+
+Use `PUFFER_TORCH_DEVICE=cpu` to force the CPU torch backend, or `PUFFER_TORCH_DEVICE=auto` to choose CUDA, MPS, then CPU in that order.
+
 Then the standard install test works without Docker or CUDA:
 
 ```bash
