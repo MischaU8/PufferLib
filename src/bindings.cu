@@ -604,6 +604,7 @@ PYBIND11_MODULE(_C, m) {
         .def_readonly("obs_dtype",     &VecEnv::obs_dtype)
         .def_readonly("obs_elem_size", &VecEnv::obs_elem_size)
         .def_readonly("gpu",           &VecEnv::gpu)
+        .def_property_readonly("vec_ptr", [](VecEnv& ve) { return (long long)ve.vec; })
         // GPU buffer pointers — wrap with torch.from_blob(..., device='cuda')
         .def_property_readonly("gpu_obs_ptr",       [](VecEnv& ve) { return (long long)ve.vec->gpu_observations; })
         .def_property_readonly("gpu_rewards_ptr",   [](VecEnv& ve) { return (long long)ve.vec->gpu_rewards; })

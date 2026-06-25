@@ -10,14 +10,20 @@ set -e
 #   ./build.sh breakout --fast       # Standalone executable (optimized)
 #   ./build.sh breakout --web        # Emscripten web build
 #   ./build.sh breakout --profile    # Kernel profiling binary
+#   ./build.sh breakout --metal-native # macOS Metal native rollout dylib
 #   ./build.sh all                   # Build all envs with default and --float
 
 if [ -z "$1" ]; then
-    echo "Usage: ./build.sh ENV_NAME [--float] [--debug] [--local|--fast|--web|--profile|--cpu|--all]"
+    echo "Usage: ./build.sh ENV_NAME [--float] [--debug] [--local|--fast|--web|--profile|--cpu|--metal-native|--all]"
     exit 1
 fi
 ENV=$1
 shift
+PYTHON_BIN=${PYTHON_BIN:-$(command -v python3 || command -v python || true)}
+if [ -z "$PYTHON_BIN" ]; then
+    echo "Error: python3 or python is required for build configuration"
+    exit 1
+fi
 
 for arg in "$@"; do
     case $arg in
@@ -28,6 +34,7 @@ for arg in "$@"; do
         --web)   MODE=web ;;
         --profile) MODE=profile ;;
         --cpu)   MODE=cpu; PRECISION="-DPRECISION_FLOAT" ;;
+        --metal-native) MODE=metal_native ;;
         *) echo "Error: unknown argument '$arg'" && exit 1 ;;
     esac
 done
@@ -53,6 +60,12 @@ fi
 # Linux/mac
 PLATFORM="$(uname -s)"
 MACHINE="$(uname -m)"
+
+if [ "$MODE" = "metal_native" ] && [ "$PLATFORM" != "Darwin" ]; then
+    echo "Native Metal rollout requires macOS with Metal support."
+    exit 1
+fi
+
 if [ "$PLATFORM" = "Linux" ]; then
     RAYLIB_NAME='raylib-5.5_linux_amd64'
     OMP_LIB=-lomp5
@@ -118,13 +131,26 @@ EXTRA_SRC=""
 EXTRA_LDFLAGS=()
 
 if [ "$PLATFORM" = "Darwin" ]; then
+    TORCH_LIBOMP_DIR=$("$PYTHON_BIN" -c "import pathlib, torch; p=pathlib.Path(torch.__file__).parent/'lib'/'libomp.dylib'; print(p.parent if p.exists() else '')" 2>/dev/null || echo "")
     for omp_prefix in /opt/homebrew/opt/libomp /usr/local/opt/libomp; do
         if [ -d "$omp_prefix" ]; then
             EXTRA_CFLAGS+=" -I$omp_prefix/include"
-            EXTRA_LDFLAGS+=("-L$omp_prefix/lib")
             break
         fi
     done
+    if [ -n "$TORCH_LIBOMP_DIR" ] && { [ "$MODE" = "cpu" ] || [ "$MODE" = "metal_native" ] || [ -z "$MODE" ]; }; then
+        # Torch macOS wheels bundle libomp with install name
+        # /opt/llvm-openmp/lib/libomp.dylib. Linking extensions against that
+        # same library identity avoids loading Homebrew libomp alongside torch.
+        EXTRA_LDFLAGS+=("-L$TORCH_LIBOMP_DIR")
+    else
+        for omp_prefix in /opt/homebrew/opt/libomp /usr/local/opt/libomp; do
+            if [ -d "$omp_prefix" ]; then
+                EXTRA_LDFLAGS+=("-L$omp_prefix/lib")
+                break
+            fi
+        done
+    fi
 fi
 
 if [ "$ENV" = "constellation" ]; then
@@ -235,10 +261,10 @@ for dir in /usr/local/cuda/lib64 /usr/lib/x86_64-linux-gnu; do
     fi
 done
 if [ -z "$CUDNN_IFLAG" ]; then
-    CUDNN_IFLAG=$(python -c "import nvidia.cudnn, os; print('-I' + os.path.join(nvidia.cudnn.__path__[0], 'include'))" 2>/dev/null || echo "")
+    CUDNN_IFLAG=$("$PYTHON_BIN" -c "import nvidia.cudnn, os; print('-I' + os.path.join(nvidia.cudnn.__path__[0], 'include'))" 2>/dev/null || echo "")
 fi
 if [ -z "$CUDNN_LFLAG" ]; then
-    CUDNN_LFLAG=$(python -c "import nvidia.cudnn, os; print('-L' + os.path.join(nvidia.cudnn.__path__[0], 'lib'))" 2>/dev/null || echo "")
+    CUDNN_LFLAG=$("$PYTHON_BIN" -c "import nvidia.cudnn, os; print('-L' + os.path.join(nvidia.cudnn.__path__[0], 'lib'))" 2>/dev/null || echo "")
 fi
 
 # NCCL include/lib fallback (mirrors the cuDNN fallback above).
@@ -252,10 +278,10 @@ for dir in /usr/lib/x86_64-linux-gnu /usr/local/cuda/lib64; do
     if [ -f "$dir/libnccl.so" ] || [ -f "$dir/libnccl.so.2" ]; then NCCL_LFLAG="-L$dir"; break; fi
 done
 if [ -z "$NCCL_IFLAG" ]; then
-    NCCL_IFLAG=$(python -c "import nvidia.nccl, os; print('-I' + os.path.join(nvidia.nccl.__path__[0], 'include'))" 2>/dev/null || echo "")
+    NCCL_IFLAG=$("$PYTHON_BIN" -c "import nvidia.nccl, os; print('-I' + os.path.join(nvidia.nccl.__path__[0], 'include'))" 2>/dev/null || echo "")
 fi
 if [ -z "$NCCL_LFLAG" ]; then
-    NCCL_LFLAG=$(python -c "import nvidia.nccl, os; print('-L' + os.path.join(nvidia.nccl.__path__[0], 'lib'))" 2>/dev/null || echo "")
+    NCCL_LFLAG=$("$PYTHON_BIN" -c "import nvidia.nccl, os; print('-L' + os.path.join(nvidia.nccl.__path__[0], 'lib'))" 2>/dev/null || echo "")
 fi
 
 WHEEL_RPATH_FLAGS=()
@@ -272,10 +298,10 @@ NVCC="ccache $CUDA_HOME/bin/nvcc"
 CC="${CC:-$(command -v ccache >/dev/null && echo 'ccache clang' || echo 'clang')}"
 ARCH=${NVCC_ARCH:-native}
 
-PYTHON_INCLUDE=$(python -c "import sysconfig; print(sysconfig.get_path('include'))")
-PYBIND_INCLUDE=$(python -c "import pybind11; print(pybind11.get_include())")
-NUMPY_INCLUDE=$(python -c "import numpy; print(numpy.get_include())")
-EXT_SUFFIX=$(python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+PYTHON_INCLUDE=$("$PYTHON_BIN" -c "import sysconfig; print(sysconfig.get_path('include'))")
+PYBIND_INCLUDE=$("$PYTHON_BIN" -c "import pybind11; print(pybind11.get_include())")
+NUMPY_INCLUDE=$("$PYTHON_BIN" -c "import numpy; print(numpy.get_include())")
+EXT_SUFFIX=$("$PYTHON_BIN" -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
 OUTPUT="pufferlib/_C${EXT_SUFFIX}"
 
 BINDING_SRC="$SRC_DIR/binding.c"
@@ -298,6 +324,23 @@ ${CC:-clang} -c "${CLANG_OPT[@]}" $EXTRA_CFLAGS \
     -fPIC "${OPENMP_CFLAGS[@]}" \
     "$BINDING_SRC" -o "$STATIC_OBJ"
 ar rcs "$STATIC_LIB" "$STATIC_OBJ"
+
+if [ "$MODE" = "metal_native" ]; then
+    mkdir -p build/metal
+    METAL_DYLIB="build/metal/libpuffer_metal.dylib"
+    echo "Compiling native Metal rollout dylib..."
+    ${CXX:-clang++} -std=c++17 -ObjC++ -fobjc-arc -dynamiclib \
+        "${CLANG_OPT[@]}" -Wno-c++11-narrowing $EXTRA_CFLAGS "${OPENMP_CFLAGS[@]}" \
+        -I. -Isrc -I"$SRC_DIR" -Ivendor "${INCLUDES[@]}" \
+        pufferlib/metal/puffer_metal.mm \
+        "${EXTRA_LDFLAGS[@]}" \
+        -lm -lpthread "${OPENMP_LDFLAGS[@]}" \
+        -framework Foundation -framework Metal -framework MetalPerformanceShaders \
+        -undefined dynamic_lookup \
+        -o "$METAL_DYLIB"
+    echo "Built: $METAL_DYLIB"
+    exit 0
+fi
 
 # Brittle hack: have to extract the tensor type from the static lib to build trainer
 OBS_TENSOR_T=$(awk '/^#define OBS_TENSOR_T/{print $3}' "$BINDING_SRC")
