@@ -764,14 +764,10 @@ static Client* gc_make_client(GuerrillaCheckers* env) {
     return client;
 }
 
-static void c_render(GuerrillaCheckers* env) {
-    if (IsKeyDown(KEY_ESCAPE)) exit(0);
-    if (env->client == NULL) env->client = gc_make_client(env);
-
-    Client* client = env->client;
-    int cell = client->cell;
-    BeginDrawing();
-    ClearBackground((Color){18, 24, 28, 255});
+// Board squares and pieces only; callers wrap this in Begin/EndDrawing and
+// draw their own status text (and, for the standalone client, move hints).
+static void gc_render_board(GuerrillaCheckers* env) {
+    int cell = env->client->cell;
 
     for (int y = 0; y < GC_BOARD_H; y++) {
         for (int x = 0; x < GC_BOARD_W; x++) {
@@ -800,6 +796,16 @@ static void c_render(GuerrillaCheckers* env) {
             }
         }
     }
+}
+
+static void c_render(GuerrillaCheckers* env) {
+    if (IsKeyDown(KEY_ESCAPE)) exit(0);
+    if (env->client == NULL) env->client = gc_make_client(env);
+
+    int cell = env->client->cell;
+    BeginDrawing();
+    ClearBackground((Color){18, 24, 28, 255});
+    gc_render_board(env);
 
     const char* side = env->player_to_move == GC_GUERRILLA ? "Guerrilla" : "COIN";
     const char* status = env->game_over ?
