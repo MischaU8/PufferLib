@@ -6,6 +6,9 @@ import os
 import glob
 import time
 import ctypes
+import pathlib
+import subprocess
+import sys
 from collections import defaultdict
 
 import numpy as np
@@ -15,6 +18,7 @@ import torch.distributed
 from torch.distributions.utils import logits_to_probs
 
 import pufferlib
+import pufferlib.models
 import pufferlib.pufferl
 from pufferlib.muon import Muon
 from pufferlib import _C
@@ -194,11 +198,362 @@ def _cpu_tensor(ptr, shape, dtype):
     arr = (ctype * n).from_address(ptr)
     return torch.frombuffer(arr, dtype=dtype).reshape(shape)
 
+_METAL_MAX_HEADS = 8
+
+class _MetalPolicyForwardConfig(ctypes.Structure):
+    _fields_ = [
+        ('batch_size', ctypes.c_uint32),
+        ('obs_size', ctypes.c_uint32),
+        ('hidden_size', ctypes.c_uint32),
+        ('num_layers', ctypes.c_uint32),
+        ('action_size', ctypes.c_uint32),
+        ('num_atns', ctypes.c_uint32),
+        ('act_sizes', ctypes.c_uint32 * _METAL_MAX_HEADS),
+        ('is_continuous', ctypes.c_uint32),
+    ]
+
+class _MetalPolicyForwardWeights(ctypes.Structure):
+    _fields_ = [
+        ('encoder_weight', ctypes.POINTER(ctypes.c_float)),
+        ('encoder_bias', ctypes.POINTER(ctypes.c_float)),
+        ('gru_weights', ctypes.POINTER(ctypes.c_float)),
+        ('decoder_weight', ctypes.POINTER(ctypes.c_float)),
+        ('decoder_bias', ctypes.POINTER(ctypes.c_float)),
+        ('value_weight', ctypes.POINTER(ctypes.c_float)),
+        ('value_bias', ctypes.POINTER(ctypes.c_float)),
+        ('decoder_logstd', ctypes.POINTER(ctypes.c_float)),
+    ]
+
+class _MetalPolicySampleConfig(ctypes.Structure):
+    _fields_ = [
+        ('rollout_step', ctypes.c_uint32),
+        ('rollout_horizon', ctypes.c_uint32),
+        ('seed', ctypes.c_uint32),
+        ('has_mask', ctypes.c_uint32),
+    ]
+
+# The Metal rollout path is shape-parametric over the default PufferLib policy
+# (DefaultEncoder -> N-layer MinGRU -> DefaultDecoder + value head). obs/hidden/
+# action shapes and the layer count are derived from the env and policy at
+# runtime. Discrete, multi-discrete, and continuous (Gaussian) action spaces
+# are supported.
+class _MetalPolicyRollout:
+    MAX_HIDDEN_SIZE = 512
+
+    def __init__(self, pufferl):
+        if sys.platform != 'darwin':
+            raise RuntimeError('--train.rollout-backend metal requires macOS')
+        if pufferl.gpu:
+            raise RuntimeError(
+                '--train.rollout-backend metal requires the CPU vec backend')
+
+        vec = pufferl._vec
+        policy = pufferl.policy
+
+        # Topology guards (shape-agnostic).
+        if not isinstance(policy.encoder, pufferlib.models.DefaultEncoder):
+            raise RuntimeError('--train.rollout-backend metal requires DefaultEncoder')
+        if not isinstance(policy.network, pufferlib.models.MinGRU):
+            raise RuntimeError('--train.rollout-backend metal requires MinGRU')
+        if not isinstance(policy.decoder, pufferlib.models.DefaultDecoder):
+            raise RuntimeError('--train.rollout-backend metal requires DefaultDecoder')
+        if policy.network.num_layers < 1:
+            raise RuntimeError('--train.rollout-backend metal requires num_layers >= 1')
+        act_sizes = tuple(int(a) for a in vec.act_sizes)
+        if vec.num_atns != len(act_sizes) or not (1 <= len(act_sizes) <= _METAL_MAX_HEADS):
+            raise RuntimeError(
+                f'Metal rollout supports 1..{_METAL_MAX_HEADS} action heads/dims')
+        if any(a < 1 for a in act_sizes):
+            raise RuntimeError('Metal rollout requires positive action sizes')
+        if tuple(int(a) for a in policy.decoder.nvec) != act_sizes:
+            raise RuntimeError('Metal rollout decoder/action-space mismatch')
+
+        # Derive shapes from the env and policy. For a discrete policy ACTION_SIZE
+        # is the total logit count (sum over heads); for a continuous (Gaussian)
+        # policy it is the number of action dimensions, with one mean per dim.
+        self.IS_CONTINUOUS = bool(getattr(policy.decoder, 'is_continuous', False))
+        self.OBS_SIZE = int(vec.obs_size)
+        self.HIDDEN_SIZE = int(policy.network.hidden_size)
+        self.NUM_LAYERS = int(policy.network.num_layers)
+        self.NUM_ATNS = len(act_sizes)
+        self.ACT_SIZES = act_sizes if not self.IS_CONTINUOUS else tuple(1 for _ in act_sizes)
+        self.ACTION_SIZE = self.NUM_ATNS if self.IS_CONTINUOUS else sum(act_sizes)
+        self.action_dtype = np.float32 if self.IS_CONTINUOUS else np.int32
+        if not (0 < self.HIDDEN_SIZE <= self.MAX_HIDDEN_SIZE):
+            raise RuntimeError(
+                f'Metal rollout supports hidden_size in [1, {self.MAX_HIDDEN_SIZE}], '
+                f'got {self.HIDDEN_SIZE}')
+
+        self.root = pathlib.Path(__file__).resolve().parents[1]
+        self.kernel_path = self.root / 'pufferlib' / 'metal' / 'kernels' / 'policy.metal'
+        self.lib_path = self.root / 'build' / 'metal' / 'libpuffer_metal.dylib'
+        self._compile_library()
+        self.lib = self._load_library()
+        act_sizes_arr = (ctypes.c_uint32 * _METAL_MAX_HEADS)(
+            *(list(self.ACT_SIZES) + [0] * (_METAL_MAX_HEADS - self.NUM_ATNS)))
+        self.config = _MetalPolicyForwardConfig(
+            pufferl.total_agents,
+            self.OBS_SIZE,
+            self.HIDDEN_SIZE,
+            self.NUM_LAYERS,
+            self.ACTION_SIZE,
+            self.NUM_ATNS,
+            act_sizes_arr,
+            1 if self.IS_CONTINUOUS else 0,
+        )
+        self.context = self._create_context()
+        self.actions = np.empty((pufferl.total_agents, self.NUM_ATNS), dtype=self.action_dtype)
+
+    def close(self):
+        context = getattr(self, 'context', None)
+        if context:
+            self.lib.puffer_metal_policy_destroy(context)
+            self.context = None
+
+    def _compile_library(self):
+        source = self.root / 'pufferlib' / 'metal' / 'puffer_metal.mm'
+        header = self.root / 'pufferlib' / 'metal' / 'puffer_metal.h'
+        newest_input = max(
+            source.stat().st_mtime,
+            header.stat().st_mtime,
+            self.kernel_path.stat().st_mtime,
+        )
+        if self.lib_path.exists() and self.lib_path.stat().st_mtime >= newest_input:
+            return
+
+        self.lib_path.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            'clang++', '-std=c++17', '-ObjC++', '-fobjc-arc', '-O2', '-dynamiclib',
+            str(source),
+            '-framework', 'Foundation',
+            '-framework', 'Metal',
+            '-framework', 'MetalPerformanceShaders',
+            '-o', str(self.lib_path),
+        ]
+        subprocess.run(cmd, cwd=self.root, check=True)
+
+    def _load_library(self):
+        lib = ctypes.CDLL(str(self.lib_path))
+        ctx_p = ctypes.POINTER(ctypes.c_void_p)
+        lib.puffer_metal_policy_create.argtypes = [
+            ctypes.c_char_p,
+            ctx_p,
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+        ]
+        lib.puffer_metal_policy_create.restype = ctypes.c_int
+        lib.puffer_metal_policy_destroy.argtypes = [ctypes.c_void_p]
+        lib.puffer_metal_policy_destroy.restype = None
+        lib.puffer_metal_policy_load_resident.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_MetalPolicyForwardConfig),
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(_MetalPolicyForwardWeights),
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+        ]
+        lib.puffer_metal_policy_load_resident.restype = ctypes.c_int
+        lib.puffer_metal_policy_write_observations_resident.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_MetalPolicyForwardConfig),
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+        ]
+        lib.puffer_metal_policy_write_observations_resident.restype = ctypes.c_int
+        lib.puffer_metal_policy_forward_sample_rollout_resident.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_MetalPolicyForwardConfig),
+            ctypes.POINTER(_MetalPolicySampleConfig),
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+        ]
+        lib.puffer_metal_policy_forward_sample_rollout_resident.restype = ctypes.c_int
+        lib.puffer_metal_policy_read_actions_resident.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_MetalPolicyForwardConfig),
+            ctypes.POINTER(ctypes.c_int32),
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+        ]
+        lib.puffer_metal_policy_read_actions_resident.restype = ctypes.c_int
+        lib.puffer_metal_policy_read_rollout_resident.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_MetalPolicyForwardConfig),
+            ctypes.POINTER(_MetalPolicySampleConfig),
+            ctypes.POINTER(ctypes.c_int32),
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+        ]
+        lib.puffer_metal_policy_read_rollout_resident.restype = ctypes.c_int
+        return lib
+
+    def _raise_on_error(self, rc, error):
+        if rc != 0:
+            message = error.value.decode('utf-8', 'replace')
+            raise RuntimeError(message)
+
+    def _create_context(self):
+        error = ctypes.create_string_buffer(4096)
+        context = ctypes.c_void_p()
+        rc = self.lib.puffer_metal_policy_create(
+            str(self.kernel_path).encode('utf-8'),
+            ctypes.byref(context),
+            error,
+            len(error),
+        )
+        self._raise_on_error(rc, error)
+        return context
+
+    def _array(self, tensor):
+        return np.ascontiguousarray(tensor.detach().cpu().numpy().astype(np.float32, copy=False))
+
+    def _weights(self, policy):
+        state = policy.state_dict()
+        # Stack all MinGRU layer weights into one contiguous [num_layers,
+        # 3*hidden, hidden] block (concatenated along axis 0) matching the
+        # gru_weights ABI the resident path reads with a per-layer offset.
+        gru_layers = [self._array(state[f'network.layers.{i}.weight'])
+                      for i in range(self.NUM_LAYERS)]
+        gru_weights = np.ascontiguousarray(np.concatenate(gru_layers, axis=0))
+        if self.IS_CONTINUOUS:
+            # Continuous: the decoder is a mean head plus a learned logstd vector.
+            decoder_weight = self._array(state['decoder.decoder_mean.weight'])
+            decoder_bias = self._array(state['decoder.decoder_mean.bias'])
+            decoder_logstd = self._array(state['decoder.decoder_logstd']).reshape(-1)
+        else:
+            decoder_weight = self._array(state['decoder.decoder.weight'])
+            decoder_bias = self._array(state['decoder.decoder.bias'])
+            decoder_logstd = np.zeros((1,), dtype=np.float32)  # unused by the discrete sampler
+        arrays = {
+            'encoder_weight': self._array(state['encoder.encoder.weight']),
+            'encoder_bias': self._array(state['encoder.encoder.bias']),
+            'gru_weights': gru_weights,
+            'decoder_weight': decoder_weight,
+            'decoder_bias': decoder_bias,
+            'value_weight': self._array(state['decoder.value_function.weight']).reshape(-1),
+            'value_bias': self._array(state['decoder.value_function.bias']),
+            'decoder_logstd': decoder_logstd,
+        }
+        ptr = ctypes.POINTER(ctypes.c_float)
+        weights = _MetalPolicyForwardWeights(
+            *(arrays[name].ctypes.data_as(ptr) for name, _ in _MetalPolicyForwardWeights._fields_)
+        )
+        return arrays, weights
+
+    def _obs_array(self, obs):
+        return np.ascontiguousarray(torch.as_tensor(obs).numpy().astype(np.float32, copy=False))
+
+    def load(self, policy, observations, state):
+        arrays, weights = self._weights(policy)
+        obs = self._obs_array(observations)
+        state_arr = self._array(state[0])
+        error = ctypes.create_string_buffer(4096)
+        rc = self.lib.puffer_metal_policy_load_resident(
+            self.context,
+            ctypes.byref(self.config),
+            obs.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            state_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            ctypes.byref(weights),
+            error,
+            len(error),
+        )
+        self._raise_on_error(rc, error)
+        return arrays
+
+    def write_observations(self, observations):
+        obs = self._obs_array(observations)
+        error = ctypes.create_string_buffer(4096)
+        rc = self.lib.puffer_metal_policy_write_observations_resident(
+            self.context,
+            ctypes.byref(self.config),
+            obs.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            error,
+            len(error),
+        )
+        self._raise_on_error(rc, error)
+
+    def launch_forward_sample_step(self, rollout_step, rollout_horizon, seed, action_mask=None):
+        sample_config = _MetalPolicySampleConfig(
+            rollout_step,
+            rollout_horizon,
+            seed,
+            1 if action_mask is not None else 0,
+        )
+        mask_ptr = None
+        if action_mask is not None:
+            mask_ptr = ctypes.cast(
+                int(action_mask.data_ptr()), ctypes.POINTER(ctypes.c_uint8))
+        error = ctypes.create_string_buffer(4096)
+        rc = self.lib.puffer_metal_policy_forward_sample_rollout_resident(
+            self.context,
+            ctypes.byref(self.config),
+            ctypes.byref(sample_config),
+            mask_ptr,
+            error,
+            len(error),
+        )
+        self._raise_on_error(rc, error)
+
+    def read_actions(self):
+        error = ctypes.create_string_buffer(4096)
+        rc = self.lib.puffer_metal_policy_read_actions_resident(
+            self.context,
+            ctypes.byref(self.config),
+            self.actions.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            error,
+            len(error),
+        )
+        self._raise_on_error(rc, error)
+        return self.actions
+
+    def forward_sample_step(self, rollout_step, rollout_horizon, seed,
+            action_mask=None):
+        self.launch_forward_sample_step(
+            rollout_step, rollout_horizon, seed, action_mask)
+        return self.read_actions()
+
+    def read_rollout(self, rollout_horizon, seed):
+        sample_config = _MetalPolicySampleConfig(
+            0,
+            rollout_horizon,
+            seed,
+            0,
+        )
+        shape = (rollout_horizon, self.config.batch_size)
+        actions = np.empty((rollout_horizon, self.config.batch_size, self.NUM_ATNS), dtype=self.action_dtype)
+        logprobs = np.empty(shape, dtype=np.float32)
+        values = np.empty(shape, dtype=np.float32)
+        error = ctypes.create_string_buffer(4096)
+        rc = self.lib.puffer_metal_policy_read_rollout_resident(
+            self.context,
+            ctypes.byref(self.config),
+            ctypes.byref(sample_config),
+            actions.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            logprobs.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            values.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            error,
+            len(error),
+        )
+        self._raise_on_error(rc, error)
+        return actions, logprobs, values
+
 class PuffeRL:
     def __init__(self, args, vec, policy, verbose=True):
         config = args['train']
+        rollout_backend = str(config.get('rollout_backend', 'torch')).lower()
+        if rollout_backend not in ('torch', 'metal'):
+            raise ValueError(
+                f'--train.rollout-backend must be torch or metal (got {rollout_backend!r})')
+        use_metal = rollout_backend == 'metal'
         self.train_device = torch.device(_resolve_device(config))
-        device = str(self.train_device)
+        # The Metal rollout is scheduled from Python over CPU-side env buffers,
+        # so rollout storage stays on CPU; training tensors use train_device.
+        device = 'cpu' if use_metal else str(self.train_device)
         self.device = device
 
         torch.set_float32_matmul_precision('high')
@@ -276,7 +631,12 @@ class PuffeRL:
         self.world_size = args['world_size']
 
         self.policy = policy
-        self.args['torch_device'] = str(device).upper()
+        self._metal_rollout = None
+        if use_metal:
+            self._metal_rollout = _MetalPolicyRollout(self)
+            self.args['torch_device'] = f'METAL+{self.train_device.type.upper()}'
+        else:
+            self.args['torch_device'] = str(device).upper()
         self.optimizer = Muon(
             self.policy.parameters(),
             lr=config['learning_rate'],
@@ -312,6 +672,9 @@ class PuffeRL:
         return self.model_size
 
     def rollouts(self):
+        if self._metal_rollout is not None:
+            return self._metal_rollouts()
+
         prof = self.profile
         config = self.config
         device = self.device
@@ -369,6 +732,69 @@ class PuffeRL:
         self.global_step += self.total_agents * horizon
         self.env_logs = self._vec.log()
 
+    def _metal_rollouts(self):
+        prof = self.profile
+        config = self.config
+        device = self.device
+        horizon = config['horizon']
+
+        self.state = tuple(torch.zeros_like(s) for s in self.state) if self.state else ()
+        o = self.vec_obs
+        r = torch.zeros(self.total_agents, device=device)
+        d = torch.zeros(self.total_agents, device=device)
+        m = self.vec_action_mask
+        rollout_seed = (
+            int(self.args.get('seed', config.get('seed', 0))) +
+            int(self.epoch) * 0x9e3779b9
+        ) & 0xffffffff
+
+        P = Profile
+        prof.mark(0)
+        self._metal_rollout.load(self.policy, o, self.state)
+        for t in range(horizon):
+            if self.action_masks is not None:
+                self.action_masks[t] = torch.as_tensor(m, device=device).to(
+                    dtype=torch.bool)
+
+            prof.mark(1)
+            self._metal_rollout.launch_forward_sample_step(
+                t, horizon, rollout_seed, m)
+            actions = self._metal_rollout.read_actions()
+            prof.mark(2)
+
+            with torch.no_grad():
+                self.observations[t] = torch.as_tensor(o, device=device)
+                self.rewards[t] = torch.as_tensor(r, device=device)
+                self.terminals[t] = torch.as_tensor(d, device=device).float()
+
+            actions_flat = torch.from_numpy(
+                actions.astype(np.float32, copy=True).reshape(
+                    self.total_agents, self._metal_rollout.NUM_ATNS)
+            ).contiguous()
+            self._vec.cpu_step(actions_flat.data_ptr())
+
+            o, r, d, m = self.vec_obs, self.vec_rewards, self.vec_terminals, self.vec_action_mask
+            if t + 1 < horizon:
+                self._metal_rollout.write_observations(o)
+            prof.mark(3)
+            prof.elapsed(P.EVAL_GPU, 1, 2)
+            prof.elapsed(P.EVAL_ENV, 2, 3)
+
+        rollout_actions, rollout_logprobs, rollout_values = self._metal_rollout.read_rollout(
+            horizon,
+            rollout_seed,
+        )
+        with torch.no_grad():
+            self.actions.copy_(torch.from_numpy(
+                rollout_actions.astype(np.float32, copy=False)))
+            self.logprobs.copy_(torch.from_numpy(rollout_logprobs))
+            self.values.copy_(torch.from_numpy(rollout_values))
+
+        prof.mark(1)
+        prof.elapsed(P.ROLLOUT, 0, 1)
+        self.global_step += self.total_agents * horizon
+        self.env_logs = self._vec.log()
+
     def train(self):
         prof = self.profile
         losses = defaultdict(float)
@@ -381,6 +807,11 @@ class PuffeRL:
         vf_clip = config['vf_clip_coef']
         anneal_beta = b0 + (1 - b0)*a*self.epoch/self.total_epochs
         self.ratio[:] = 1
+        # The Metal hybrid trains on MPS but keeps rollout storage, advantage
+        # computation, and importance ratios on CPU, transferring minibatch
+        # inputs to the device in a few coalesced copies.
+        use_metal_mps_train = (
+            device.type == 'mps' and self._metal_rollout is not None)
 
         learning_rate = config['learning_rate']
         if config['anneal_lr'] and self.epoch > 0:
@@ -403,26 +834,62 @@ class PuffeRL:
 
         obs = obs_cpu.to(device)
         masks = mask_cpu.to(device) if mask_cpu is not None else None
-        act = act_cpu.to(device)
-        val = val_cpu.to(device)
-        lp = lp_cpu.to(device)
-        rew = rew_cpu.to(device)
-        ter = ter_cpu.to(device)
+        if use_metal_mps_train:
+            if act_cpu.shape[-1] == 1:
+                # Single action head: coalesce act/val/lp into one transfer.
+                train_float = torch.stack(
+                    (act_cpu.squeeze(-1), val_cpu, lp_cpu), dim=0
+                ).to(device)
+                act = train_float[0].unsqueeze(-1)
+                val = train_float[1]
+                lp = train_float[2]
+            else:
+                # Multi-discrete: act carries a head dim, so transfer it on its
+                # own and coalesce only the scalar val/lp tensors.
+                val_lp = torch.stack((val_cpu, lp_cpu), dim=0).to(device)
+                act = act_cpu.to(device)
+                val = val_lp[0]
+                lp = val_lp[1]
+            advantages_cpu = torch.zeros_like(val_cpu)
+            rew = None
+            ter = None
+        else:
+            act = act_cpu.to(device)
+            val = val_cpu.to(device)
+            lp = lp_cpu.to(device)
+            rew = rew_cpu.to(device)
+            ter = ter_cpu.to(device)
+            advantages_cpu = None
 
         P = Profile
         prof.mark(0)
         num_minibatches = int(config['replay_ratio'] * self.batch_size / config['minibatch_size'])
         for mb in range(num_minibatches):
             shape = val.shape
-            advantages = torch.zeros(shape, device=device)
-            advantages = compute_puff_advantage(val, rew,
-                ter, self.ratio, advantages, config['gamma'],
-                config['gae_lambda'], config['vtrace_rho_clip'], config['vtrace_c_clip'])
+            if use_metal_mps_train:
+                # _C's advantage kernels are CPU/CUDA only; computing on the
+                # CPU copy and transferring the result beats a torch loop over
+                # horizon on MPS.
+                advantages_cpu.zero_()
+                compute_puff_advantage(val_cpu, rew_cpu,
+                    ter_cpu, self.ratio, advantages_cpu, config['gamma'],
+                    config['gae_lambda'], config['vtrace_rho_clip'], config['vtrace_c_clip'])
+                advantages = advantages_cpu.to(device)
+            else:
+                advantages = torch.zeros(shape, device=device)
+                advantages = compute_puff_advantage(val, rew,
+                    ter, self.ratio, advantages, config['gamma'],
+                    config['gae_lambda'], config['vtrace_rho_clip'], config['vtrace_c_clip'])
 
             adv = advantages.abs().sum(axis=1)
             prio_weights = torch.nan_to_num(adv**a, 0, 0, 0)
             prio_probs = (prio_weights + 1e-6)/(prio_weights.sum() + 1e-6)
             idx = _multinomial(prio_probs, self.minibatch_segments, replacement=True)
+            idx_cpu = (
+                idx.cpu()
+                if use_metal_mps_train and mb + 1 < num_minibatches
+                else None
+            )
             mb_prio = (self.total_agents*prio_probs[idx, None])**-anneal_beta
 
             mb_obs = obs[idx]
@@ -443,7 +910,11 @@ class PuffeRL:
             newlogprob = newlogprob.reshape(mb_logprobs.shape)
             logratio = newlogprob - mb_logprobs
             ratio = logratio.exp()
-            self.ratio[idx] = ratio.detach()
+            if use_metal_mps_train:
+                if idx_cpu is not None:
+                    self.ratio[idx_cpu] = ratio.detach().cpu()
+            else:
+                self.ratio[idx] = ratio.detach()
 
             with torch.no_grad():
                 old_approx_kl = (-logratio).mean()
@@ -466,6 +937,8 @@ class PuffeRL:
             entropy_loss = entropy.mean()
             loss = pg_loss + config['vf_coef']*v_loss - config['ent_coef']*entropy_loss
             val[idx] = newvalue.detach().float()
+            if use_metal_mps_train and idx_cpu is not None:
+                val_cpu[idx_cpu] = newvalue.detach().float().cpu()
 
             losses['policy_loss'] += pg_loss
             losses['value_loss'] += v_loss
@@ -535,6 +1008,9 @@ class PuffeRL:
         self._vec.render(env_id)
 
     def close(self):
+        if self._metal_rollout is not None:
+            self._metal_rollout.close()
+            self._metal_rollout = None
         self.vec_obs = None
         self.vec_rewards = None
         self.vec_terminals = None

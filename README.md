@@ -17,7 +17,13 @@ puffer train breakout
 puffer eval breakout --load-model-path latest
 ```
 
-Use `--train.device mps` to train on Apple Silicon's GPU via PyTorch MPS.
+Use `--train.device mps` to train on Apple Silicon's GPU via PyTorch MPS. For the fastest path, `--train.rollout-backend metal` additionally runs rollout policy forward and sampling through a native Metal backend (about 3x PyTorch-MPS throughput on an M1 Max):
+
+```bash
+puffer train breakout --train.device mps --train.rollout-backend metal
+```
+
+The Metal rollout supports any environment using the default policy (`DefaultEncoder -> MinGRU -> DefaultDecoder`, hidden size up to 512) with discrete, multi-discrete, or continuous action spaces; the dylib is compiled automatically on first use.
 
 ## Star to puff up the project!
 
