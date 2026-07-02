@@ -7,6 +7,16 @@ PufferLib is a fast and sane reinforcement learning library that can train tiny,
 
 All of our documentation is hosted at [puffer.ai](https://puffer.ai "PufferLib Documentation"). @jsuarez5341 on [Discord](https://discord.gg/puffer) for support. Post there before opening issues. We're always looking for new contributors!
 
+## macOS
+
+Install OpenMP with `brew install libomp`, then build and train as usual — `build.sh` defaults to the CPU PyTorch backend on macOS:
+
+```bash
+bash build.sh breakout
+puffer train breakout
+puffer eval breakout --load-model-path latest
+```
+
 ## Star to puff up the project!
 
 <a href="https://star-history.com/#pufferai/pufferlib&Date">
