@@ -17,6 +17,8 @@ puffer train breakout
 puffer eval breakout --load-model-path latest
 ```
 
+Use `--train.device mps` to train on Apple Silicon's GPU via PyTorch MPS.
+
 ## Star to puff up the project!
 
 <a href="https://star-history.com/#pufferai/pufferlib&Date">
