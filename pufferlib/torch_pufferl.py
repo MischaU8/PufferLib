@@ -474,7 +474,16 @@ class Profile:
 
 def load_policy(args, vec):
     import pufferlib.models
-    policy_kwargs = args['policy']
+    # Sweep-populated configs store float means for integer hyperparameters
+    # (e.g. num_layers = 2.11327). The Protein sweep rounds integer params before
+    # use (pufferlib/sweep.py: is_integer -> round); mirror that here on a local
+    # copy so direct/.ini runs build a valid network instead of crashing on
+    # range(float) / nn.Linear(float). The original args are left untouched so the
+    # sampled float is still preserved for logging.
+    policy_kwargs = dict(args['policy'])
+    for key in ('num_layers', 'hidden_size'):
+        if isinstance(policy_kwargs.get(key), float):
+            policy_kwargs[key] = round(policy_kwargs[key])
     network_cls = getattr(pufferlib.models, args['torch']['network'])
     encoder_cls = getattr(pufferlib.models, args['torch']['encoder'])
     decoder_cls = getattr(pufferlib.models, args['torch']['decoder'])
