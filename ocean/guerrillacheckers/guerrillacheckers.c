@@ -3,6 +3,9 @@
 // piece or point, then a destination). AI vs AI can also run as a fast
 // tournament with a running win tally. Works the same in native and
 // Emscripten web builds.
+#include <stdio.h>
+#include <time.h>
+
 #include "guerrillacheckers.h"
 #include "puffernet.h"
 
@@ -21,6 +24,7 @@ enum {
 
 typedef struct {
     const char* label;
+    const char* name;
     int opponent;
     int mcts_iterations;
 } GcDemoLevel;
@@ -28,11 +32,11 @@ typedef struct {
 #define GC_DEMO_NET_BOT -1  // sentinel opponent id: puffernet policy
 
 static const GcDemoLevel gc_demo_levels[] = {
-    {"1", GC_BOT_RANDOM, 0},
-    {"2", GC_BOT_GREEDY, 0},
-    {"3", GC_DEMO_NET_BOT, 0},
-    {"4", GC_BOT_MCTS, 2000},
-    {"5", GC_BOT_MCTS, 10000},
+    {"1", "RANDOM", GC_BOT_RANDOM, 0},
+    {"2", "GREEDY", GC_BOT_GREEDY, 0},
+    {"3", "PUFFER NN", GC_DEMO_NET_BOT, 0},
+    {"4", "MCTS 2K", GC_BOT_MCTS, 2000},
+    {"5", "MCTS 10K", GC_BOT_MCTS, 10000},
 };
 #define GC_DEMO_LEVEL_COUNT 5
 #define GC_DEMO_LEVEL_NET 2      // index of the PUFFER NN entry
@@ -634,8 +638,8 @@ static int gc_demo_render_tourney(GuerrillaCheckers* env, GcDemoUi* ui) {
     return menu_clicked;
 }
 
-static int gc_demo_bot_action(GuerrillaCheckers* env, GcDemoUi* ui) {
-    const GcDemoLevel* level = &gc_demo_levels[ui->ai_level[env->player_to_move]];
+static int gc_demo_level_action(GuerrillaCheckers* env, int level_index) {
+    const GcDemoLevel* level = &gc_demo_levels[level_index];
     if (level->opponent == GC_DEMO_NET_BOT) {
         if (gc_demo_net_loaded) return gc_demo_net_action(env);
         level = &gc_demo_levels[GC_DEMO_LEVEL_MCTS_2K];
@@ -643,6 +647,10 @@ static int gc_demo_bot_action(GuerrillaCheckers* env, GcDemoUi* ui) {
     env->opponent = level->opponent;
     env->mcts_iterations = level->mcts_iterations;
     return gc_bot_action(env);
+}
+
+static int gc_demo_bot_action(GuerrillaCheckers* env, GcDemoUi* ui) {
+    return gc_demo_level_action(env, ui->ai_level[env->player_to_move]);
 }
 
 static void demo(void) {
@@ -775,7 +783,184 @@ static void demo(void) {
     gc_demo_free(&env);
 }
 
-int main(void) {
+// ---------------------------------------------------------------------------
+// Headless CLI tournament (--tournament [games]): every bot as Guerrilla
+// plays every bot as COIN, then W-L, decisions per second, and Elo are
+// reported per (bot, side) since the two roles play very differently.
+// Never touches raylib.
+
+#define GC_CLI_MAX_ENTITIES (2 * GC_DEMO_LEVEL_COUNT)
+
+typedef struct {
+    int wins;
+    int losses;
+    long decisions;
+    double seconds;
+} GcCliStats;
+
+static double gc_cli_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+// Bradley-Terry strengths from the pairwise score matrix, reported on the
+// Elo scale anchored at 1500 mean. A half-win prior per pairing keeps
+// shut-out entries (0 wins) at a finite rating. Guerrilla entries only ever
+// meet COIN entries; the bipartite graph is fully connected, which is all
+// the fit needs.
+static void gc_cli_elo(int entities,
+        double score[GC_CLI_MAX_ENTITIES][GC_CLI_MAX_ENTITIES],
+        int played[GC_CLI_MAX_ENTITIES][GC_CLI_MAX_ENTITIES], double* elo) {
+    double p[GC_CLI_MAX_ENTITIES];
+    for (int e = 0; e < entities; e++) p[e] = 1.0;
+
+    for (int iter = 0; iter < 1000; iter++) {
+        double next[GC_CLI_MAX_ENTITIES];
+        for (int e = 0; e < entities; e++) {
+            double won = 0.0;
+            double denom = 0.0;
+            for (int f = 0; f < entities; f++) {
+                if (f == e || played[e][f] == 0) continue;
+                won += score[e][f] + 0.5;
+                denom += ((double)played[e][f] + 1.0) / (p[e] + p[f]);
+            }
+            next[e] = won / denom;
+        }
+        double log_mean = 0.0;
+        for (int e = 0; e < entities; e++) log_mean += log(next[e]);
+        double scale = exp(log_mean / entities);
+        for (int e = 0; e < entities; e++) p[e] = next[e] / scale;
+    }
+
+    for (int e = 0; e < entities; e++) {
+        elo[e] = 1500.0 + 400.0 * log10(p[e]);
+    }
+}
+
+static int gc_cli_tournament(int games) {
+    GuerrillaCheckers env = {0};
+    env.num_agents = 1;
+    env.selfplay = 1;
+    env.mcts_exploration = GC_MCTS_DEFAULT_EXPLORATION;
+    env.mcts_rollout = GC_MCTS_ROLLOUT_GREEDY;
+    env.rng = 1u;
+    gc_demo_allocate(&env);
+
+    gc_demo_net_loaded =
+        gc_demo_net_init(&gc_demo_nets[GC_GUERRILLA], GC_DEMO_NET_WEIGHTS) &&
+        gc_demo_net_init(&gc_demo_nets[GC_COIN], GC_DEMO_NET_WEIGHTS);
+
+    int roster[GC_DEMO_LEVEL_COUNT];
+    int n_bots = 0;
+    for (int i = 0; i < GC_DEMO_LEVEL_COUNT; i++) {
+        if (gc_demo_levels[i].opponent == GC_DEMO_NET_BOT && !gc_demo_net_loaded) {
+            fprintf(stderr, "note: skipping %s (missing %s)\n",
+                gc_demo_levels[i].name, GC_DEMO_NET_WEIGHTS);
+            continue;
+        }
+        roster[n_bots++] = i;
+    }
+
+    // Entity e < n_bots is roster[e] playing Guerrilla; e >= n_bots is
+    // roster[e - n_bots] playing COIN.
+    int entities = 2 * n_bots;
+    static GcCliStats stats[GC_CLI_MAX_ENTITIES];
+    static double score[GC_CLI_MAX_ENTITIES][GC_CLI_MAX_ENTITIES];
+    static int played[GC_CLI_MAX_ENTITIES][GC_CLI_MAX_ENTITIES];
+
+    printf("Per-side round-robin: %d bots per side, %d games per pairing, %d games total\n\n",
+        n_bots, games, n_bots * n_bots * games);
+
+    for (int a = 0; a < n_bots; a++) {
+        for (int b = 0; b < n_bots; b++) {
+            int g_bot = roster[a];
+            int c_bot = roster[b];
+            int g_entity = a;
+            int c_entity = n_bots + b;
+            int g_wins = 0;
+            int c_wins = 0;
+            for (int g = 0; g < games; g++) {
+                env.rng = (0x9E3779B9u * (unsigned int)((a * 16 + b) * 100003 + g)) | 1u;
+                c_reset(&env);
+                gc_demo_net_reset();
+
+                int plies = 0;
+                while (!env.game_over && plies++ < 600) {
+                    int guerrilla_to_move = env.player_to_move == GC_GUERRILLA;
+                    int mover = guerrilla_to_move ? g_entity : c_entity;
+                    double t0 = gc_cli_now();
+                    int action = gc_demo_level_action(&env,
+                        guerrilla_to_move ? g_bot : c_bot);
+                    stats[mover].seconds += gc_cli_now() - t0;
+                    stats[mover].decisions++;
+                    gc_apply_action(&env, action);
+                    gc_prepare_turn(&env);
+                }
+
+                // Draws are impossible; the ply cap is unreachable, but if a
+                // game ever stalled the env's timeout rule (COIN wins) applies.
+                int winner = env.game_over && env.winner == GC_GUERRILLA ?
+                    g_entity : c_entity;
+                int loser = winner == g_entity ? c_entity : g_entity;
+                stats[winner].wins++;
+                stats[loser].losses++;
+                score[winner][loser] += 1.0;
+                played[g_entity][c_entity]++;
+                played[c_entity][g_entity]++;
+                if (winner == g_entity) g_wins++;
+                else c_wins++;
+                fprintf(stderr, "\rG %-9s vs C %-9s  %3d/%d ",
+                    gc_demo_levels[g_bot].name, gc_demo_levels[c_bot].name,
+                    g + 1, games);
+            }
+            fprintf(stderr, "\r");
+            printf("G %-9s vs C %-9s  %3d-%3d\n", gc_demo_levels[g_bot].name,
+                gc_demo_levels[c_bot].name, g_wins, c_wins);
+            fflush(stdout);
+        }
+    }
+
+    double elo[GC_CLI_MAX_ENTITIES];
+    gc_cli_elo(entities, score, played, elo);
+
+    // Sort entities by Elo, best first.
+    int order[GC_CLI_MAX_ENTITIES];
+    for (int e = 0; e < entities; e++) order[e] = e;
+    for (int a = 1; a < entities; a++) {
+        int v = order[a];
+        int b = a - 1;
+        while (b >= 0 && elo[order[b]] < elo[v]) {
+            order[b + 1] = order[b];
+            b--;
+        }
+        order[b + 1] = v;
+    }
+
+    printf("\n%-9s  %-9s  %5s %5s  %10s  %5s\n", "AI", "SIDE", "W", "L", "SPS", "ELO");
+    for (int a = 0; a < entities; a++) {
+        int e = order[a];
+        int level = roster[e < n_bots ? e : e - n_bots];
+        GcCliStats* s = &stats[e];
+        double sps = s->seconds > 0.0 ? (double)s->decisions / s->seconds : 0.0;
+        printf("%-9s  %-9s  %5d %5d  %10.0f  %5.0f\n", gc_demo_levels[level].name,
+            e < n_bots ? "GUERRILLA" : "COIN", s->wins, s->losses, sps, elo[e]);
+    }
+
+    gc_demo_free(&env);
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    if (argc > 1) {
+        if (strcmp(argv[1], "--tournament") == 0) {
+            int games = argc > 2 ? atoi(argv[2]) : 100;
+            if (games <= 0) games = 100;
+            return gc_cli_tournament(games);
+        }
+        fprintf(stderr, "usage: %s [--tournament [games-per-pairing]]\n", argv[0]);
+        return 1;
+    }
     demo();
     return 0;
 }
