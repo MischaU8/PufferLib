@@ -594,6 +594,21 @@ __global__ void sample_logits(
 
 // Single step rollout forward pass. Called by each environment worker in their
 // own buffer thread. This operation is cudagraphed.
+__global__ void zero_recurrent_state_on_terminal(
+        precision_t* state, const float* terminals, int num_layers,
+        int state_batch, int bank_size, int hidden_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_layers * bank_size * hidden_size;
+    if (idx >= total) return;
+    int hidden = idx % hidden_size;
+    int row = (idx / hidden_size) % bank_size;
+    int layer = idx / (bank_size * hidden_size);
+    if (terminals[row] != 0.0f) {
+        state[((long)layer * state_batch + row) * hidden_size + hidden] =
+            from_float(0.0f);
+    }
+}
+
 extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     PuffeRL* pufferl = (PuffeRL*)ctx;
     HypersT& hypers = pufferl->hypers;
@@ -688,6 +703,21 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
         if (rollouts.action_mask.data != nullptr) {
             mask_b = puf_slice(rollouts.action_mask, t, sub_start, bank_size);
             mask_stride_b = mask_stride;
+        }
+
+        // Environment autoreset happens inside c_step. The terminal flag copied
+        // after the previous step therefore marks exactly the recurrent rows
+        // whose next observation starts a new episode. Preserve every other row
+        // across rollout boundaries; reset primary and frozen banks symmetrically.
+        if (hypers.reset_state) {
+            int state_batch = s_bank->shape[1];
+            int state_hidden = s_bank->shape[2];
+            int state_layers = s_bank->shape[0];
+            int state_total = state_layers * bank_size * state_hidden;
+            zero_recurrent_state_on_terminal<<<
+                grid_size(state_total), BLOCK_SIZE, 0, stream>>>(
+                    s_bank->data, env.terminals.data + sub_start,
+                    state_layers, state_batch, bank_size, state_hidden);
         }
 
         PrecisionTensor dec_puf = policy_forward(p_bank, *w_bank, *a_bank, obs_b, *s_bank, stream);

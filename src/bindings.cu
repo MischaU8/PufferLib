@@ -3,12 +3,64 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
+#include <vector>
 #include "pufferlib.cu"
 
 #define _PUFFER_STRINGIFY(x) #x
 #define PUFFER_STRINGIFY(x) _PUFFER_STRINGIFY(x)
 
 namespace py = pybind11;
+
+static bool test_recurrent_terminal_reset() {
+    constexpr int num_layers = 2;
+    constexpr int state_batch = 2;
+    constexpr int bank_size = 2;
+    constexpr int hidden_size = 3;
+    constexpr int state_elems = num_layers * state_batch * hidden_size;
+
+    precision_t* state = nullptr;
+    float* terminals = nullptr;
+    if (cudaMalloc(&state, state_elems * sizeof(precision_t)) != cudaSuccess ||
+            cudaMalloc(&terminals, state_batch * sizeof(float)) != cudaSuccess) {
+        cudaFree(state);
+        cudaFree(terminals);
+        throw std::runtime_error("failed to allocate recurrent reset test buffers");
+    }
+
+    cudaMemset(state, 1, state_elems * sizeof(precision_t));
+    const float first_terminals[state_batch] = {0.0f, 1.0f};
+    cudaMemcpy(terminals, first_terminals, sizeof(first_terminals), cudaMemcpyHostToDevice);
+    zero_recurrent_state_on_terminal<<<grid_size(state_elems), BLOCK_SIZE>>>(
+        state, terminals, num_layers, state_batch, bank_size, hidden_size);
+
+    std::vector<unsigned char> after_reset(state_elems * sizeof(precision_t));
+    cudaMemcpy(after_reset.data(), state, after_reset.size(), cudaMemcpyDeviceToHost);
+    bool correct = cudaGetLastError() == cudaSuccess;
+    for (int layer = 0; layer < num_layers; layer++) {
+        for (int row = 0; row < state_batch; row++) {
+            for (int hidden = 0; hidden < hidden_size; hidden++) {
+                int elem = (layer * state_batch + row) * hidden_size + hidden;
+                for (size_t byte = 0; byte < sizeof(precision_t); byte++) {
+                    unsigned char expected = row == 1 ? 0 : 1;
+                    correct = correct && after_reset[elem * sizeof(precision_t) + byte] == expected;
+                }
+            }
+        }
+    }
+
+    // A rollout boundary without an episode boundary must preserve both rows.
+    const float no_terminals[state_batch] = {0.0f, 0.0f};
+    cudaMemcpy(terminals, no_terminals, sizeof(no_terminals), cudaMemcpyHostToDevice);
+    zero_recurrent_state_on_terminal<<<grid_size(state_elems), BLOCK_SIZE>>>(
+        state, terminals, num_layers, state_batch, bank_size, hidden_size);
+    std::vector<unsigned char> after_rollout(state_elems * sizeof(precision_t));
+    cudaMemcpy(after_rollout.data(), state, after_rollout.size(), cudaMemcpyDeviceToHost);
+    correct = correct && cudaGetLastError() == cudaSuccess && after_rollout == after_reset;
+
+    cudaFree(state);
+    cudaFree(terminals);
+    return correct;
+}
 
 // Wrapper functions for Python bindings
 pybind11::dict puf_log(pybind11::object pufferl_obj) {
@@ -136,20 +188,6 @@ void rollouts(pybind11::object pufferl_obj) {
     PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
     pybind11::gil_scoped_release no_gil;
     double t0 = wall_clock();
-
-    // Zero state buffers (primary + every frozen bank, so all banks see fresh
-    // state symmetrically — otherwise frozen banks accumulate indefinitely while
-    // primary resets, giving primary an unfair in-distribution advantage).
-    if (pufferl.hypers.reset_state) {
-        for (int i = 0; i < pufferl.hypers.num_buffers; i++) {
-            puf_zero(&pufferl.buffer_states[i], pufferl.default_stream);
-        }
-        for (int b = 0; b < pufferl.num_frozen_banks; b++) {
-            for (int i = 0; i < pufferl.hypers.num_buffers; i++) {
-                puf_zero(&pufferl.frozen_banks[b].buffer_states[i], pufferl.default_stream);
-            }
-        }
-    }
 
     static_vec_omp_step(pufferl.vec);
     float sec = (float)(wall_clock() - t0);
@@ -611,6 +649,7 @@ PYBIND11_MODULE(_C, m) {
         double now = wall_clock();
         return now - pufferl.start_time;
     });
+    m.def("test_recurrent_terminal_reset", &test_recurrent_terminal_reset);
     m.def("puff_advantage", &py_puff_advantage);
     m.def("create_vec", &create_vec, py::arg("args"), py::arg("gpu") = 1);
     py::class_<VecEnv, std::unique_ptr<VecEnv>>(m, "VecEnv")
