@@ -511,6 +511,11 @@ PYBIND11_MODULE(_C, m) {
     m.attr("precision_bytes") = (int)sizeof(precision_t);
     m.attr("env_name") = PUFFER_STRINGIFY(ENV_NAME);
     m.attr("gpu") = 1;
+#ifdef PUFFERLIB_UNCLIPPED_REWARDS
+    m.attr("clips_rewards") = false;
+#else
+    m.attr("clips_rewards") = true;
+#endif
 
     // Core functions
     m.def("log", &puf_log);
@@ -573,7 +578,19 @@ PYBIND11_MODULE(_C, m) {
     py::class_<PrecisionTensor>(m, "PrecisionTensor")
         .def("__repr__", [](const PrecisionTensor& t) { return std::string(puf_repr(&t)); })
         .def("ndim", [](const PrecisionTensor& t) { return ndim(t.shape); })
-        .def("numel", [](const PrecisionTensor& t) { return numel(t.shape); });
+        .def("numel", [](const PrecisionTensor& t) { return numel(t.shape); })
+        .def("copy_to_float", [](const PrecisionTensor& t, long long dst_ptr) {
+            if (!t.data || dst_ptr == 0) {
+                throw std::runtime_error("copy_to_float requires non-empty source and destination");
+            }
+            int n = numel(t.shape);
+            cast<<<grid_size(n), BLOCK_SIZE>>>(
+                reinterpret_cast<float*>(dst_ptr), t.data, n);
+            cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                throw std::runtime_error(cudaGetErrorString(err));
+            }
+        });
     py::class_<FloatTensor>(m, "FloatTensor")
         .def("__repr__", [](const FloatTensor& t) { return std::string(puf_repr(&t)); })
         .def("ndim", [](const FloatTensor& t) { return ndim(t.shape); })

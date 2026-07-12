@@ -1531,9 +1531,11 @@ void train_impl(PuffeRL& pufferl) {
             rollouts.action_mask.data, src.action_mask.data, T, B, mask_size);
     }
 
-    // We hard-clamp rewards to -1, 1. Our envs are mostly designed to respect this range
+#ifndef PUFFERLIB_UNCLIPPED_REWARDS
+    // Most bundled environments expect the historical trainer-side clamp.
     clamp_precision_kernel<<<grid_size(numel(rollouts.rewards.shape)), BLOCK_SIZE, 0, train_stream>>>(
         rollouts.rewards.data, -1.0f, 1.0f, numel(rollouts.rewards.shape));
+#endif
 
     // Set importance weights to 1.0
     fill_precision_kernel<<<grid_size(numel(rollouts.ratio.shape)), BLOCK_SIZE, 0, train_stream>>>(
