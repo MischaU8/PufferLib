@@ -468,7 +468,7 @@ def sweep(env_name, args=None, pareto=False):
 def eval(env_name, args=None, load_path=None):
     '''Evaluate a trained policy. Supports both native and --slowly torch backends.'''
     args = args or load_config(env_name)
-    args['reset_state'] = False
+    args['reset_state'] = True
     args['train']['horizon'] = 1
 
     backend = _resolve_backend(args)
@@ -500,7 +500,7 @@ def match(env_name, policy_a_path, policy_b_path, num_games=4096, args=None, ver
     Both checkpoints must come from the same env / arch.
     '''
     args = args or load_config(env_name)
-    args['reset_state'] = False
+    args['reset_state'] = True
     args['train']['horizon'] = 1
     args.setdefault('nccl_id', b'')  # match is always single-GPU
     # Sweep suggestions can give odd agents_per_buffer (e.g. num_buffers=5,

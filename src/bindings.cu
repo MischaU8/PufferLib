@@ -3,6 +3,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
+#include <algorithm>
 #include <vector>
 #include "pufferlib.cu"
 
@@ -60,6 +61,142 @@ static bool test_recurrent_terminal_reset() {
     cudaFree(state);
     cudaFree(terminals);
     return correct;
+}
+
+static void fill_recurrent_states(PuffeRL& pufferl, unsigned char value) {
+    for (int buf = 0; buf < pufferl.hypers.num_buffers; buf++) {
+        PrecisionTensor& state = pufferl.buffer_states[buf];
+        cudaMemsetAsync(state.data, value,
+            numel(state.shape) * sizeof(precision_t), pufferl.default_stream);
+    }
+    for (int bank = 0; bank < pufferl.num_frozen_banks; bank++) {
+        WeightBank& frozen = pufferl.frozen_banks[bank];
+        for (int buf = 0; buf < pufferl.hypers.num_buffers; buf++) {
+            PrecisionTensor& state = frozen.buffer_states[buf];
+            cudaMemsetAsync(state.data, value,
+                numel(state.shape) * sizeof(precision_t),
+                pufferl.default_stream);
+        }
+    }
+    cudaDeviceSynchronize();
+}
+
+static bool recurrent_tensor_bytes_equal(
+        const PrecisionTensor& state, int active_rows,
+        unsigned char expected) {
+    size_t bytes = numel(state.shape) * sizeof(precision_t);
+    std::vector<unsigned char> host(bytes);
+    cudaMemcpy(host.data(), state.data, bytes, cudaMemcpyDeviceToHost);
+    int layers = state.shape[0];
+    int batch = state.shape[1];
+    int hidden = state.shape[2];
+    if (active_rows < 0) active_rows = batch;
+    for (int layer = 0; layer < layers; layer++) {
+        for (int row = 0; row < active_rows; row++) {
+            for (int unit = 0; unit < hidden; unit++) {
+                int elem = (layer * batch + row) * hidden + unit;
+                for (size_t byte = 0; byte < sizeof(precision_t); byte++) {
+                    if (host[elem * sizeof(precision_t) + byte] != expected)
+                        return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static bool recurrent_states_equal(PuffeRL& pufferl,
+        unsigned char expected, bool active_only) {
+    int block_size = pufferl.vec->total_agents / pufferl.hypers.num_buffers;
+    int primary_rows = pufferl.bank_layout ?
+        pufferl.bank_layout[1] - pufferl.bank_layout[0] : block_size;
+    for (int buf = 0; buf < pufferl.hypers.num_buffers; buf++) {
+        int rows = active_only ? primary_rows : -1;
+        if (!recurrent_tensor_bytes_equal(
+                pufferl.buffer_states[buf], rows, expected)) return false;
+    }
+    for (int bank = 0; bank < pufferl.num_frozen_banks; bank++) {
+        WeightBank& frozen = pufferl.frozen_banks[bank];
+        int bank_rows = pufferl.bank_layout ?
+            pufferl.bank_layout[bank + 2] - pufferl.bank_layout[bank + 1] :
+            frozen.slice_size;
+        for (int buf = 0; buf < pufferl.hypers.num_buffers; buf++) {
+            int rows = active_only ? bank_rows : -1;
+            if (!recurrent_tensor_bytes_equal(
+                    frozen.buffer_states[buf], rows, expected)) return false;
+        }
+    }
+    return true;
+}
+
+static void apply_terminal_resets_for_test(PuffeRL& pufferl) {
+    int block_size = pufferl.vec->total_agents / pufferl.hypers.num_buffers;
+    int num_banks = 1 + pufferl.num_frozen_banks;
+    for (int buf = 0; buf < pufferl.hypers.num_buffers; buf++) {
+        int start = buf * block_size;
+        for (int bank = 0; bank < num_banks; bank++) {
+            int bank_off = pufferl.bank_layout ? pufferl.bank_layout[bank] : 0;
+            int bank_end = pufferl.bank_layout ?
+                pufferl.bank_layout[bank + 1] : block_size;
+            int bank_size = bank_end - bank_off;
+            PrecisionTensor* state = bank == 0 ?
+                &pufferl.buffer_states[buf] :
+                &pufferl.frozen_banks[bank - 1].buffer_states[buf];
+            zero_recurrent_bank_state_on_terminal(
+                &pufferl, state,
+                pufferl.env.terminals.data + start + bank_off,
+                bank_size, pufferl.default_stream);
+        }
+    }
+    cudaDeviceSynchronize();
+}
+
+static bool test_recurrent_states_zero(pybind11::object pufferl_obj) {
+    PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
+    cudaDeviceSynchronize();
+    return recurrent_states_equal(pufferl, 0, false);
+}
+
+static void test_fill_recurrent_states(pybind11::object pufferl_obj) {
+    PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
+    fill_recurrent_states(pufferl, 1);
+}
+
+static bool test_frozen_recurrent_states_zero(
+        pybind11::object pufferl_obj, int bank) {
+    PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
+    if (bank < 0 || bank >= pufferl.num_frozen_banks) return false;
+    cudaDeviceSynchronize();
+    for (int buf = 0; buf < pufferl.hypers.num_buffers; buf++) {
+        if (!recurrent_tensor_bytes_equal(
+                pufferl.frozen_banks[bank].buffer_states[buf], -1, 0))
+            return false;
+    }
+    return true;
+}
+
+static bool test_recurrent_episode_boundary(pybind11::object pufferl_obj) {
+    PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
+    if (!pufferl.hypers.reset_state) return false;
+    std::vector<float> terminals(pufferl.vec->total_agents, 0.0f);
+
+    fill_recurrent_states(pufferl, 1);
+    cudaMemcpy(pufferl.env.terminals.data, terminals.data(),
+        terminals.size() * sizeof(float), cudaMemcpyHostToDevice);
+    apply_terminal_resets_for_test(pufferl);
+    bool preserved = recurrent_states_equal(pufferl, 1, true);
+
+    std::fill(terminals.begin(), terminals.end(), 1.0f);
+    cudaMemcpy(pufferl.env.terminals.data, terminals.data(),
+        terminals.size() * sizeof(float), cudaMemcpyHostToDevice);
+    apply_terminal_resets_for_test(pufferl);
+    bool cleared = recurrent_states_equal(pufferl, 0, true);
+
+    cudaMemset(pufferl.env.terminals.data, 0,
+        terminals.size() * sizeof(float));
+    zero_all_recurrent_states(&pufferl, pufferl.default_stream);
+    cudaDeviceSynchronize();
+    return preserved && cleared;
 }
 
 // Wrapper functions for Python bindings
@@ -253,6 +390,8 @@ void load_weights(pybind11::object pufferl_obj, const std::string& path) {
         cast<<<grid_size(n), BLOCK_SIZE, 0, pufferl.default_stream>>>(
             pufferl.param_puf.data, pufferl.master_weights.data, n);
     }
+    zero_all_recurrent_states(&pufferl, pufferl.default_stream);
+    cudaDeviceSynchronize();
 }
 
 int py_add_frozen_bank(py::object pufferl_obj, int slice_size,
@@ -650,6 +789,10 @@ PYBIND11_MODULE(_C, m) {
         return now - pufferl.start_time;
     });
     m.def("test_recurrent_terminal_reset", &test_recurrent_terminal_reset);
+    m.def("test_recurrent_states_zero", &test_recurrent_states_zero);
+    m.def("test_fill_recurrent_states", &test_fill_recurrent_states);
+    m.def("test_frozen_recurrent_states_zero", &test_frozen_recurrent_states_zero);
+    m.def("test_recurrent_episode_boundary", &test_recurrent_episode_boundary);
     m.def("puff_advantage", &py_puff_advantage);
     m.def("create_vec", &create_vec, py::arg("args"), py::arg("gpu") = 1);
     py::class_<VecEnv, std::unique_ptr<VecEnv>>(m, "VecEnv")

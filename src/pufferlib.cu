@@ -388,6 +388,23 @@ typedef struct {
     int* bank_layout;
 } PuffeRL;
 
+static void zero_weight_bank_recurrent_states(PuffeRL* pufferl,
+        WeightBank* bank, cudaStream_t stream) {
+    for (int buf = 0; buf < pufferl->hypers.num_buffers; buf++) {
+        puf_zero(&bank->buffer_states[buf], stream);
+    }
+}
+
+static void zero_all_recurrent_states(PuffeRL* pufferl, cudaStream_t stream) {
+    for (int buf = 0; buf < pufferl->hypers.num_buffers; buf++) {
+        puf_zero(&pufferl->buffer_states[buf], stream);
+    }
+    for (int bank = 0; bank < pufferl->num_frozen_banks; bank++) {
+        zero_weight_bank_recurrent_states(
+            pufferl, &pufferl->frozen_banks[bank], stream);
+    }
+}
+
 Dict* log_environments_impl(PuffeRL& pufferl) {
     // Capacity raised from 32 to 64 to accommodate chess's per-bank
     // hist_score_bank_<b> / hist_n_bank_<b> entries (16 keys for 8 banks).
@@ -609,6 +626,20 @@ __global__ void zero_recurrent_state_on_terminal(
     }
 }
 
+static void zero_recurrent_bank_state_on_terminal(
+        PuffeRL* pufferl, PrecisionTensor* state, const float* terminals,
+        int bank_size, cudaStream_t stream) {
+    if (!pufferl->hypers.reset_state || bank_size == 0) return;
+    int state_batch = state->shape[1];
+    int state_hidden = state->shape[2];
+    int state_layers = state->shape[0];
+    int state_total = state_layers * bank_size * state_hidden;
+    zero_recurrent_state_on_terminal<<<
+        grid_size(state_total), BLOCK_SIZE, 0, stream>>>(
+            state->data, terminals, state_layers, state_batch,
+            bank_size, state_hidden);
+}
+
 extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     PuffeRL* pufferl = (PuffeRL*)ctx;
     HypersT& hypers = pufferl->hypers;
@@ -709,16 +740,9 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
         // after the previous step therefore marks exactly the recurrent rows
         // whose next observation starts a new episode. Preserve every other row
         // across rollout boundaries; reset primary and frozen banks symmetrically.
-        if (hypers.reset_state) {
-            int state_batch = s_bank->shape[1];
-            int state_hidden = s_bank->shape[2];
-            int state_layers = s_bank->shape[0];
-            int state_total = state_layers * bank_size * state_hidden;
-            zero_recurrent_state_on_terminal<<<
-                grid_size(state_total), BLOCK_SIZE, 0, stream>>>(
-                    s_bank->data, env.terminals.data + sub_start,
-                    state_layers, state_batch, bank_size, state_hidden);
-        }
+        zero_recurrent_bank_state_on_terminal(
+            pufferl, s_bank, env.terminals.data + sub_start,
+            bank_size, stream);
 
         PrecisionTensor dec_puf = policy_forward(p_bank, *w_bank, *a_bank, obs_b, *s_bank, stream);
 
@@ -1922,6 +1946,7 @@ extern "C" void pufferl_load_frozen_bank(PuffeRL* pufferl, int bank_idx, const c
         cast<<<grid_size(n), BLOCK_SIZE, 0, pufferl->default_stream>>>(
             bank->param_puf.data, bank->master_weights.data, n);
     }
+    zero_weight_bank_recurrent_states(pufferl, bank, pufferl->default_stream);
     cudaDeviceSynchronize();
 }
 
@@ -2224,6 +2249,9 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
             rng_init<<<grid_size(agents_per_buf), BLOCK_SIZE>>>(
                 pufferl->rng_states[i], pufferl->seed + i, agents_per_buf);
         }
+        // Graph capture executes policy_forward and advances persistent state.
+        // A newly created runner must begin with no synthetic episode history.
+        zero_all_recurrent_states(pufferl.get(), pufferl->default_stream);
         cudaDeviceSynchronize();
 
         pufferl->epoch = 0;
