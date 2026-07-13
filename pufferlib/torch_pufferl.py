@@ -46,16 +46,71 @@ def _entropy(logits):
     p_log_p = logits * logits_to_probs(logits)
     return -p_log_p.sum(-1)
 
-def sample_logits(logits, action=None):
+def _split_action_mask(action_mask, logits):
+    sizes = [l.shape[-1] for l in logits]
+    return torch.split(action_mask.reshape(-1, sum(sizes)), sizes, dim=-1)
+
+
+def _apply_action_mask(logits, action_mask):
+    if action_mask is None:
+        return logits
+    if isinstance(logits, torch.Tensor):
+        mask = action_mask.reshape(logits.shape).to(
+            device=logits.device, dtype=torch.bool)
+        return logits.masked_fill(~mask, -1.0e4)
+    masks = _split_action_mask(action_mask, logits)
+    masked = []
+    for logit, mask in zip(logits, masks):
+        mask = mask.to(device=logit.device, dtype=torch.bool)
+        masked.append(logit.masked_fill(~mask, -1.0e4))
+    return tuple(masked)
+
+
+def _action_mask_for_sampled_logits(action_mask, logits):
+    if action_mask is None:
+        return None
+    if isinstance(logits, torch.Tensor):
+        return action_mask.reshape(logits.shape).to(
+            device=logits.device, dtype=torch.bool).unsqueeze(0)
+    masks = _split_action_mask(action_mask, logits)
+    return torch.nn.utils.rnn.pad_sequence(
+        [mask.to(device=logit.device, dtype=torch.bool).transpose(0, 1)
+         for logit, mask in zip(logits, masks)],
+        batch_first=False,
+        padding_value=False,
+    ).permute(1, 2, 0)
+
+
+def _repair_sampled_actions(action, action_mask):
+    sampled_is_legal = action_mask.gather(
+        -1, action.long().unsqueeze(-1)).squeeze(-1)
+    has_legal_action = action_mask.any(dim=-1)
+    action_indices = torch.arange(
+        action_mask.shape[-1], device=action_mask.device).view(
+            *([1] * (action_mask.ndim - 1)), action_mask.shape[-1])
+    fallback = torch.where(action_mask, action_indices, -1).amax(dim=-1)
+    repair = has_legal_action & ~sampled_is_legal
+    return torch.where(repair, fallback.to(action.dtype), action)
+
+
+def sample_logits(logits, action=None, action_mask=None):
     is_discrete = isinstance(logits, torch.Tensor)
     if isinstance(logits, torch.distributions.Normal):
+        if action_mask is not None:
+            raise RuntimeError('Action masks are only supported for discrete policies')
         batch = logits.loc.shape[0]
         if action is None:
             action = logits.sample().view(batch, -1)
         log_probs = logits.log_prob(action.view(batch, -1)).sum(1)
         logits_entropy = logits.entropy().view(batch, -1).sum(1)
         return action, log_probs, logits_entropy
-    elif is_discrete:
+    sampled = action is None
+    sample_action_mask = (
+        _action_mask_for_sampled_logits(action_mask, logits)
+        if sampled else None
+    )
+    logits = _apply_action_mask(logits, action_mask)
+    if is_discrete:
         logits = logits.unsqueeze(0)
     else: # multi-discrete
         logits = torch.nn.utils.rnn.pad_sequence(
@@ -71,6 +126,8 @@ def sample_logits(logits, action=None):
         probs = torch.nan_to_num(probs, 1e-8, 1e-8, 1e-8)
         action = torch.multinomial(probs.reshape(-1, probs.shape[-1]), 1, replacement=True).int()
         action = action.reshape(probs.shape[:-1])
+        if sample_action_mask is not None:
+            action = _repair_sampled_actions(action, sample_action_mask)
     else:
         batch = logits[0].shape[0]
         action = action.view(batch, -1).T
@@ -128,6 +185,17 @@ class PuffeRL:
         total_agents = vec.total_agents
         self.total_agents = total_agents
         obs_dtype = _OBS_DTYPE_MAP.get(vec.obs_dtype, torch.uint8)
+        if vec.action_mask_size:
+            policy_act_sizes = tuple(
+                int(a) for a in getattr(policy.decoder, 'nvec', vec.act_sizes))
+            policy_action_size = sum(policy_act_sizes)
+            if int(vec.action_mask_size) != policy_action_size:
+                raise RuntimeError(
+                    'Action mask size mismatch: '
+                    f'vec.action_mask_size={int(vec.action_mask_size)} but '
+                    f'sum(act_sizes)={policy_action_size}. Masked envs must '
+                    'define MY_ACTION_MASK equal to the total policy logit count.'
+                )
 
         if self.gpu:
             self.vec_obs = torch.as_tensor(_CudaPtr(vec.gpu_obs_ptr,
@@ -136,6 +204,11 @@ class PuffeRL:
                 (total_agents,), torch.float32))
             self.vec_terminals = torch.as_tensor(_CudaPtr(vec.gpu_terminals_ptr,
                 (total_agents,), torch.float32))
+            self.vec_action_mask = (
+                torch.as_tensor(_CudaPtr(vec.gpu_action_mask_ptr,
+                    (total_agents, vec.action_mask_size), torch.uint8))
+                if vec.action_mask_size else None
+            )
         else:
             self.vec_obs = _cpu_tensor(vec.obs_ptr,
                 (total_agents, vec.obs_size), obs_dtype)
@@ -143,6 +216,11 @@ class PuffeRL:
                 (total_agents,), torch.float32)
             self.vec_terminals = _cpu_tensor(vec.terminals_ptr,
                 (total_agents,), torch.float32)
+            self.vec_action_mask = (
+                _cpu_tensor(vec.action_mask_ptr,
+                    (total_agents, vec.action_mask_size), torch.uint8)
+                if vec.action_mask_size else None
+            )
 
         vec.reset()
         horizon = config['horizon']
@@ -155,6 +233,11 @@ class PuffeRL:
         self.logprobs = torch.zeros(horizon, total_agents, device=device)
         self.rewards = torch.zeros(horizon, total_agents, device=device)
         self.terminals = torch.zeros(horizon, total_agents, device=device)
+        self.action_masks = (
+            torch.zeros(horizon, total_agents, vec.action_mask_size,
+                dtype=torch.bool, device=device)
+            if vec.action_mask_size else None
+        )
         self.ratio = torch.ones(total_agents, horizon, device=device)
         self.state = policy.initial_state(total_agents, device=device)
 
@@ -210,21 +293,28 @@ class PuffeRL:
         o = self.vec_obs
         r = torch.zeros(self.total_agents, device=device)
         d = torch.zeros(self.total_agents, device=device)
+        m = self.vec_action_mask
 
         P = Profile
         prof.mark(0)
         for t in range(horizon):
             o_device = torch.as_tensor(o, device=device)
+            m_device = (
+                torch.as_tensor(m, device=device).to(dtype=torch.bool)
+                if m is not None else None
+            )
 
             prof.mark(1)
             with torch.no_grad():
                 logits, value, state = self.policy.forward_eval(o_device, self.state)
-                action, logprob, _ = sample_logits(logits)
+                action, logprob, _ = sample_logits(logits, action_mask=m_device)
             prof.mark(2)
 
             with torch.no_grad():
                 self.state = state
                 self.observations[t] = o_device
+                if self.action_masks is not None:
+                    self.action_masks[t] = m_device
                 self.actions[t] = action
                 self.logprobs[t] = logprob
                 self.rewards[t] = torch.as_tensor(r, device=device)
@@ -240,7 +330,7 @@ class PuffeRL:
             else:
                 self._vec.cpu_step(actions_flat.data_ptr())
 
-            o, r, d = self.vec_obs, self.vec_rewards, self.vec_terminals
+            o, r, d, m = self.vec_obs, self.vec_rewards, self.vec_terminals, self.vec_action_mask
             prof.mark(3)
             prof.elapsed(P.EVAL_GPU, 1, 2)
             prof.elapsed(P.EVAL_ENV, 2, 3)
@@ -277,6 +367,10 @@ class PuffeRL:
         lp = self.logprobs.T.contiguous()
         rew = self.rewards.T.contiguous().clamp(-1, 1)
         ter = self.terminals.T.contiguous()
+        masks = (
+            self.action_masks.transpose(0, 1).contiguous()
+            if self.action_masks is not None else None
+        )
 
         P = Profile
         prof.mark(0)
@@ -298,13 +392,15 @@ class PuffeRL:
             mb_obs = obs[idx]
             mb_actions = act[idx]
             mb_logprobs = lp[idx]
+            mb_masks = masks[idx] if masks is not None else None
             mb_values = val[idx]
             mb_returns = advantages[idx] + mb_values
             mb_advantages = advantages[idx]
 
             prof.mark(1)
             logits, newvalue = self.policy(mb_obs)
-            actions, newlogprob, entropy = sample_logits(logits, action=mb_actions)
+            actions, newlogprob, entropy = sample_logits(
+                logits, action=mb_actions, action_mask=mb_masks)
             prof.mark(2)
             prof.elapsed(P.TRAIN_FORWARD, 1, 2)
 
@@ -513,4 +609,3 @@ def load_policy(args, vec):
         policy.load_state_dict(state_dict)
 
     return policy
-

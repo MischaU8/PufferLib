@@ -94,6 +94,7 @@ struct VecEnv {
     int total_agents;
     int obs_size;
     int num_atns;
+    int action_mask_size;
     std::vector<int> act_sizes;
     std::string obs_dtype;
     size_t obs_elem_size;
@@ -116,6 +117,7 @@ static std::unique_ptr<VecEnv> create_vec(py::dict args, int gpu = 0) {
     ve->total_agents = total_agents;
     ve->obs_size = get_obs_size();
     ve->num_atns = get_num_atns();
+    ve->action_mask_size = ve->vec->action_mask_size;
     {
         int* raw = get_act_sizes();
         int n = get_num_act_sizes();
@@ -172,6 +174,7 @@ PYBIND11_MODULE(_C, m) {
         .def_readonly("total_agents", &VecEnv::total_agents)
         .def_readonly("obs_size", &VecEnv::obs_size)
         .def_readonly("num_atns", &VecEnv::num_atns)
+        .def_readonly("action_mask_size", &VecEnv::action_mask_size)
         .def_readonly("act_sizes", &VecEnv::act_sizes)
         .def_readonly("obs_dtype", &VecEnv::obs_dtype)
         .def_readonly("obs_elem_size", &VecEnv::obs_elem_size)
@@ -179,6 +182,7 @@ PYBIND11_MODULE(_C, m) {
         .def_property_readonly("obs_ptr", [](VecEnv& ve) { return (long long)ve.vec->observations; })
         .def_property_readonly("rewards_ptr", [](VecEnv& ve) { return (long long)ve.vec->rewards; })
         .def_property_readonly("terminals_ptr", [](VecEnv& ve) { return (long long)ve.vec->terminals; })
+        .def_property_readonly("action_mask_ptr", [](VecEnv& ve) { return (long long)ve.vec->action_mask; })
         .def("reset", &vec_reset)
         .def("cpu_step", &cpu_vec_step_py)
         .def("render", [](VecEnv& ve, int env_id) { static_vec_render(ve.vec, env_id); })
