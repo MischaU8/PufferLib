@@ -113,6 +113,8 @@ struct Env {
     int mcts_iterations;      // MCTS search budget per move (opponent == GC_BOT_MCTS)
     float mcts_exploration;   // UCB1 exploration constant
     int mcts_rollout;         // GC_MCTS_ROLLOUT_RANDOM / GC_MCTS_ROLLOUT_GREEDY
+    float capture_reward_guerrilla;
+    float capture_reward_coin;
 };
 
 static inline int gc_actor_slot(GuerrillaCheckers* env) {
@@ -135,6 +137,9 @@ void puf_init(Env* env, Dict* kwargs) {
     env->mcts_iterations = (int)dict_get(kwargs, "mcts_iterations");
     env->mcts_exploration = (float)dict_get(kwargs, "mcts_exploration");
     env->mcts_rollout = (int)dict_get(kwargs, "mcts_rollout");
+    env->capture_reward_guerrilla =
+        (float)dict_get(kwargs, "capture_reward_guerrilla");
+    env->capture_reward_coin = (float)dict_get(kwargs, "capture_reward_coin");
     env->num_agents = env->selfplay ? 2 : 1;
     env->agents[0].policy = 0;
     env->agents[1].policy = 1;
@@ -854,7 +859,9 @@ void puf_step(Env* env) {
     int captures = gc_apply_action(env, action);
     float reward = 0.0f;
     if (captures > 0) {
-        reward += (actor == GC_GUERRILLA ? 0.05f : 0.03f) * (float)captures;
+        reward += (actor == GC_GUERRILLA ?
+            env->capture_reward_guerrilla : env->capture_reward_coin) *
+            (float)captures;
     }
 
     // Bot mode: play the opponent's reply(ies) so the game returns to the

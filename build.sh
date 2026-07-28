@@ -267,6 +267,7 @@ if [ "$MODE" = "native" ]; then
         -I$CUDA_HOME/include $NCCL_IFLAG -I$RAYLIB_NAME/include \
 	    "${ENV_COMPILE_FLAGS[@]}" \
 	    -DENV_NAME=$ENV \
+	    -DPUFFER_ENV_NAME=\"$ENV\" \
 	    -DPUFFERLIB_BUILD_MAIN \
 	    -Xcompiler=-DPLATFORM_DESKTOP \
 	    -Xcompiler=-fopenmp \
@@ -287,6 +288,7 @@ elif [ "$MODE" = "profile" ]; then
         -I$CUDA_HOME/include $NCCL_IFLAG -I$RAYLIB_NAME/include \
         "${ENV_COMPILE_FLAGS[@]}" \
         -DENV_NAME=$ENV \
+        -DPUFFER_ENV_NAME=\"$ENV\" \
         -Xcompiler=-DPLATFORM_DESKTOP \
         $PRECISION \
         -Xcompiler=-fopenmp \
